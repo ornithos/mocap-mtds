@@ -13,6 +13,7 @@ azure/
 *.txt
 *.pdf
 .ipynb*
+model_data/
 saved_notebooks/
 plots/
 stan/
