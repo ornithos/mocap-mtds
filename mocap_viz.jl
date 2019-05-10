@@ -100,7 +100,7 @@ end
 
 
 function create_animation(data::Vector, names::Union{String, Array{String}}="dataset";
-    vis=Nothing, parents=[1,2,3,4,1,6,7,8,1,10,11,12,12,14,15,16,12,18,19,20],
+    vis=nothing, parents=[1,2,3,4,1,6,7,8,1,10,11,12,12,14,15,16,12,18,19,20],
     jointmesh::Union{AbstractMaterial, Vector{T} where T <: AbstractMaterial}=greymesh,
     linemesh::Union{AbstractMaterial, Vector{T} where T <: AbstractMaterial}=yellowmesh, scale=0.1)
 
@@ -116,7 +116,7 @@ function create_animation(data::Vector, names::Union{String, Array{String}}="dat
     # any(ls .> length(parents)) && @warn format("({:d}/{:d}) datasets have fewer joints than specified in parents.",
     #     sum(ls .> length(parents)), n)
 
-    if vis === Nothing
+    if vis === nothing
         vis = Visualizer()
         open(vis)
     else
