@@ -5,6 +5,7 @@ using MeshCat
 using CoordinateTransformations: LinearMap, AffineMap, Translation, rotation_between
 using GeometryTypes: Cylinder, HyperSphere, Point
 using LinearAlgebra: norm
+using DSP   # conv
 using Colors: RGBA, RGB
 using Formatting, ArgCheck
 
@@ -102,7 +103,8 @@ end
 function create_animation(data::Vector, names::Union{String, Array{String}}="dataset";
     vis=nothing, parents=[1,2,3,4,1,6,7,8,1,10,11,12,12,14,15,16,12,18,19,20],
     jointmesh::Union{AbstractMaterial, Vector{T} where T <: AbstractMaterial}=greymesh,
-    linemesh::Union{AbstractMaterial, Vector{T} where T <: AbstractMaterial}=yellowmesh, scale=0.1)
+    linemesh::Union{AbstractMaterial, Vector{T} where T <: AbstractMaterial}=yellowmesh, scale=0.1,
+    camera::Symbol=:front)
 
     Ts = [size(d,1) for d in data]
     ls = [size(d,2) for d in data]
@@ -110,8 +112,9 @@ function create_animation(data::Vector, names::Union{String, Array{String}}="dat
     (names isa String) && (names = [names * string(i) for i in 1:n])
     (jointmesh isa AbstractMaterial) && (jointmesh = [jointmesh for i in 1:n])
     (linemesh isa AbstractMaterial) && (linemesh = [linemesh for i in 1:n])
-    @assert length(data) == length(names)
+    @argcheck length(data) == length(names)
     @assert (all([ndims(d) for d in data] .== 3) && all([size(d,3) for d in data] .==3)) "Need NxJx3 matrices."
+    @argcheck camera in [:front, :back, :static]
     # @assert all(ls .<= length(parents)-1) "more joints given (dim 1) than are assigned parents."
     # any(ls .> length(parents)) && @warn format("({:d}/{:d}) datasets have fewer joints than specified in parents.",
     #     sum(ls .> length(parents)), n)
@@ -141,9 +144,15 @@ function create_animation(data::Vector, names::Union{String, Array{String}}="dat
 
 
     anim = Animation()
+    maxT = maximum(Ts)
+
+    cam_ix = 1
+    pos = hcat([data[cam_ix][tt,1,1]*scale for tt in 1:maxT], [data[cam_ix][tt,1,3]*scale for tt in 1:maxT])
+    pos = hcat(conv(pos[:,1], Windows.rect(4)/4), conv(pos[:,2], Windows.rect(4)/4))[1:maxT,:]
+    cc = [scale, scale] * (camera == :front ? -1 : +1)
 
     reord = [1,3,2] # need to permute z/y axis for three.js setup
-    for tt in 1:maximum(Ts)
+    for tt in 1:maxT
         atframe(anim, vis, tt-1) do frame
             for i in 1:n
                 if Ts[i] >= tt
@@ -151,6 +160,10 @@ function create_animation(data::Vector, names::Union{String, Array{String}}="dat
                     update_pos!(lines, data[i][tt,:,reord]*scale, parents)
                     update_pos!(joints, data[i][tt,:,reord]*scale);
                     settransform_collection!(frame[names[i]], lines, joints, true)
+
+                    if camera != :static
+                        settransform!(frame["/Cameras/default"], Translation(pos[tt,1] + cc[1], pos[tt,2] + cc[2], 1))
+                    end
                 end
             end
         end
