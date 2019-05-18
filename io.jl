@@ -345,9 +345,10 @@ function construct_inputs(X, raw; direction=:relative)
     # proc = (N-2)   *  [ rvel (1), xvel (1), zvel (1), feet (4),  pos (63),  vel (63),  rot (63) ]
     use_ixs = range(70, stop=size(X, 1) - 60)
     N = length(use_ixs)
+    T = eltype(raw)
 
     # traj_pos (12x2), abs./rel. direction (12x2), abs. velocity (12), joint positions (63)
-    Xs = Matrix{eltype(raw)}(undef, N, 48 + 12 + 61)
+    Xs = Matrix{T}(undef, N, 48 + 12 + 61)
 
     # add rel. pos from raw
     Xs[:, 61] = raw[use_ixs,9]          # x,z value of root are always zero
@@ -361,6 +362,15 @@ function construct_inputs(X, raw; direction=:relative)
     end
     Xs[:,1:12] .-= Xs[:,7]
     Xs[:,13:24] .-= Xs[:,19]
+
+    # convert Euler trajectory to Lagrangian frame
+    prev_dir = hcat(-Xs[:,6], -Xs[:,18])   # ∵ [7] == 0, hence diff is -[6]
+    cθ, sθ   = _trigvecs(prev_dir, hcat(zeros(T, N, 1), ones(T, N, 1))) # calc angle to z-axis (2nd cood)
+    cθ, sθ   = cθ, sθ  # reverse sign of θ (note cos is unchanged ∵ even fn)
+    euler_traj  = Xs[:,1:24]  # implicit copy
+    Xs[:,1:12]  = euler_traj[:,1:12] .* cθ - euler_traj[:,13:24] .* sθ
+    Xs[:,13:24] = euler_traj[:,1:12] .* sθ + euler_traj[:,13:24] .* cθ
+
 
     # Calculate body direction and velocity
     # ---------------------------------------
