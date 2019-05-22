@@ -1,6 +1,8 @@
 module mocaputil
 
 using StatsBase, Statistics, MultivariateStats
+using ArgCheck
+
 export transform, scale_transform
 export fit
 export invert
@@ -82,4 +84,78 @@ function invert(s::MyStandardScaler, X::Matrix, dims::Int=s.dims)
 end
 
 
+
+"""
+    fit(OutputDifferencer, Y)
+
+Differences the joint positions in an output matrix `Y`, size N x d, with d
+either {64, 68}, depending on whether foot contacts were appended. This utility
+essentially just performs differencing of the middle columns 4:64, but saves
+the initial frame, since this is lost with differencing. The transformation can
+then be inverted using the `invert` command to modelled data. Note however that
+because we're using diff/cumsum on potentially large arrays, the accumulated
+error can be nontrivial, especially if using Float32s.
+
+Methods:
+    s = fit(OutputDifferencer, Y)                   # fit object (i.e. check dims, and save first frame)
+    Ydiff = difference_transform(s, Y)              # perform transformation
+    s, Ydiff = fit_transform(OutputDifferencer, Y)  # do both at once.
+    Yhat = invert(s, Ydiff)                         # invert transformation.
+"""
+mutable struct OutputDifferencer{T}
+    first_frame::Array{T, 1}
+    operate_on::AbstractArray{L where L <: Int,1}
+end
+
+Base.length(s::OutputDifferencer) = length(s.first_frame, 1)
+Base.copy(s::OutputDifferencer) = OutputDifferencer(copy(s.first_frame), copy(s.operate_on))
+
+function StatsBase.fit(::Type{OutputDifferencer}, Y)
+    @argcheck size(Y, 2) in [64, 68]
+    return OutputDifferencer(Y[1,:], 4:64)
+end
+
+function difference_transform(s::OutputDifferencer, Y)
+    @assert Y[1,:] == s.first_frame
+    return hcat(Y[2:end,1:(s.operate_on[1] - 1)],
+        diff(Y[:,s.operate_on], dims=1),
+        Y[2:end,(s.operate_on[end] + 1):end])
+end
+
+function fit_transform(::Type{OutputDifferencer}, Y)
+    s = fit(OutputDifferencer, Y)
+    return s, difference_transform(s, Y)
+end
+
+function invert(s::OutputDifferencer, Y)
+    tr_first = reshape(s.first_frame, 1, :)
+    inv = cumsum(vcat(tr_first[:,s.operate_on], Y[:,s.operate_on]), dims=1)
+    return vcat(tr_first,
+                hcat(Y[:,1:(s.operate_on[1] - 1)],
+                    inv[2:end,:],
+                    Y[:,(s.operate_on[end] + 1):end])
+                )
+end
+
+"""
+    no_pos(X)
+
+where X is an *INPUT DATA* matrix. X will be checked to be the right input
+matrix size, and then discard the joint position elements. Note that this
+returns a view of `X`, rather than a copy.
+
+`no_poscp` is a shortcut for the copy version, otherwise do:
+
+    no_pos(X; doCopy = true)
+"""
+function no_pos(X::AbstractMatrix; doCopy=false)
+    @argcheck size(X, 2) == 121
+    return doCopy ? X[:,1:60] : view(X, :, 1:60)
+end
+"""
+    no_poscp(X)
+
+removes joint positions from an input array X (returns a copy). See `no_pos`.
+"""
+no_poscp(X::AbstractMatrix) = no_pos(X; doCopy=true)
 end # module end

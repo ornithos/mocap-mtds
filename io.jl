@@ -299,7 +299,7 @@ end
 
 
 """
-    construct_inputs(raw [; direction])
+    construct_inputs(raw [; direction=:relative, joint_pos=true])
 
 Construct the input matrix for the mocap models. The input `raw` is the raw
 output from the `process_file` function. The function outputs the following
@@ -318,7 +318,7 @@ The following columns are contained in the matrix:
 * (12): ± 60 frame trajectory angle sin(θ) to forward
 * (12): ± 60 frame trajectory angle cos(θ) to forward
 * (12): ± 60 frame trajectory magnitude of velocity
-* (61): joint positions in Lagrangian frame
+* (61): joint positions in Lagrangian frame (optional)
 
 The angle θ is expressed in both sine and cosine components to avoid a
 discontinuity when it wraps around 2π (which it sometimes does). This angle
@@ -329,14 +329,19 @@ which case, pass in the named argument `direction=:absolute`.
 
 Note that there are only 61 dimensions of the joint positions as the root x,z
 are excluded, as they are always zero. They're excluded from the output too,
-which is more important: we don't want to waste strength on predicting zero.
+which is more important: we don't want to waste strength on predicting zero. In
+most of my experiments, I have found that including the joint positions in the
+input tends to make it too easy for the model to obtain trivial predictions. To
+avoid returning any joint_positions in the input matrix, select:
+
+    joint_pos=false
 """
-function construct_inputs(raw; direction=:relative)
+function construct_inputs(raw; direction=:relative, joint_pos=true)
     X = reconstruct_raw(raw)
-    construct_inputs(X, raw; direction=direction)
+    construct_inputs(X, raw; direction=direction, joint_pos=joint_pos)
 end
 
-function construct_inputs(X, raw; direction=:relative)
+function construct_inputs(X, raw; direction=:relative, joint_pos=true)
     @argcheck direction in [:relative, :absolute]
     @argcheck size(X)[2:3] == (21, 3)
     @argcheck size(raw, 2) == 196
@@ -348,11 +353,14 @@ function construct_inputs(X, raw; direction=:relative)
     T = eltype(raw)
 
     # traj_pos (12x2), abs./rel. direction (12x2), abs. velocity (12), joint positions (63)
-    Xs = Matrix{T}(undef, N, 48 + 12 + 61)
+    jpnum = joint_pos ? 61 : 0
+    Xs = Matrix{T}(undef, N, 48 + 12 + jpnum)
 
     # add rel. pos from raw
-    Xs[:, 61] = raw[use_ixs,9]          # x,z value of root are always zero
-    Xs[:, 62:end] = raw[use_ixs,11:70]
+    if joint_pos
+        Xs[:, 61] = raw[use_ixs,9]          # x,z value of root are always zero
+        Xs[:, 62:end] = raw[use_ixs,11:70]
+    end
 
     # Extract -60:10:59 trajectory on a rolling basis
     # ---------------------------------------
