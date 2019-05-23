@@ -3,6 +3,8 @@ using StatsBase, LinearAlgebra, MultivariateStats
 using Flux
 using AxUtil     # (Math: cayley /skew-symm stuff)
 using ArgCheck
+include("./util.jl")
+import .mocaputil: MyStandardScaler, invert
 
 abstract type MyLDS end
 
@@ -102,9 +104,12 @@ function init_LDS(A::AbstractMatrix{T}, B::AbstractMatrix{T}, b::AbstractVector{
     init_LDS(T, A, B, b, C, D, d)
 end
 
-function init_LDS_spectral(Y::AbstractMatrix{T}, U::AbstractMatrix{T}, k::Int) where T <: AbstractFloat
+function init_LDS_spectral(Y::AbstractMatrix{T}, U::AbstractMatrix{T}, k::Int;
+    max_iter::Int = 4, return_hist::Bool=false) where T <: AbstractFloat
+
     @argcheck size(Y,2) == size(U,2)
     cT(x) = convert(Array{T}, x)
+    rmse(Δ) = sqrt(mean(x->x^2, Δ))
 
     pc_all = fit(PPCA, Y)
     Xhat = transform(pc_all, Y)[1:k,:];
@@ -112,40 +117,80 @@ function init_LDS_spectral(Y::AbstractMatrix{T}, U::AbstractMatrix{T}, k::Int) w
     N = size(Y, 2)
     d_in = size(U, 1)
 
-    # Process inputs
-    cUs_m1 = U[:, 1:N-1];
+    # iterates
+    rmse_history = ones(T, max_iter) * Inf
+    lds_history = Vector{Any}(undef, max_iter)
 
     # Initialise emission
     C = projection(pc_all)[:,1:k]
     D = zeros(T, N, d_in)
     d = mean(pc_all);
 
-    # 1-step cood descent initialised from "cheat": proj. of *current* y_ts
-    ABb = Xhat[:, 2:N] / vcat(Xhat[:, 1:N-1], cUs_m1[:,1:N-1], ones(T, N-1,1)')
+    # Begin quasi-coordinate descent
+    for i = 1:max_iter
+        # 1-step cood descent initialised from "cheat": proj. of *current* y_ts
+        Xhat = hcat(zeros(T, k, 1), Xhat)   # X starts from zero (i.e index 2 => x_1 etc.)
+        ABb = Xhat[:, 2:N+1] / vcat(Xhat[:, 1:N], U[:,1:N], ones(T, N,1)')
 
-    # poor man's stable projection
-    Asvd = svd(ABb[:, 1:k])
-    A = Asvd.U * diagm(0=>min.(Asvd.S, 1)) * Asvd.V' |> cT
+        A = ABb[:, 1:k]
+        Aeig = eigen(A)
 
-    # rest of dynamics
-    B = ABb[:,k+1:end-1] |> cT
-    b = ABb[:,end] |> cT
+        # poor man's stable projection
+        if any(abs.(Aeig.values) .> 1)
+            ub = 1.0
+            for i in 1:10
+                λ = [v / max(ub, abs(v) + sqrt(eps(T))) for v ∈ Aeig.values]
+                A = real(Aeig.vectors * Diagonal(λ) * Aeig.vectors') |> cT
 
-    # state rollout
-    Xhat = Matrix{T}(undef, k, N);
-    Xhat[:,1] = zeros(T, k)
-    for i in 2:N
-        @views Xhat[:,i] = A*Xhat[:,i-1] + B*U[:,i-1] + b
+                Aeig = eigen(A)
+                if all(abs.(Aeig.values) .<= 1)
+                    break
+                elseif i == 10
+                    error("Unable to stabilise A matrix (if problematic, implement proper optim).")
+                end
+                ub *= 0.97
+            end
+
+        end
+
+        # rest of dynamics
+        B = ABb[:,k+1:end-1] |> cT
+        b = ABb[:,end] |> cT
+
+        # state rollout
+        Xhat = Matrix{T}(undef, k, N+1);
+        Xhat[:,1] = zeros(T, k)
+        # remember here that Xhat is zero-based and U is 1-based.
+        for i in 1:N
+            @views Xhat[:,i+1] = A*Xhat[:,i] + B*U[:,i] + b
+        end
+
+        # regression of emission pars to current latent Xs
+        CDd = Y / [Xhat[:, 2:N+1]; U; ones(1, N)]
+        C = CDd[:, 1:k]
+        D = CDd[:, k+1:end-1]
+        d = CDd[:, end];
+        rmse_history[i] = rmse(Y - CDd * [Xhat[:, 2:N+1]; U; ones(1, N)])
+
+        A, B, b, C, D, d = A |> cT, B |>cT, b |>cT, C |>cT, D |>cT, d |>cT
+
+        lds_history[i] = model.init_LDS(T, A, B, b, C, D, d)
+
+        if i < max_iter
+            Xhat = C \ (Y[:, 1:end] - D*U[:,1:end] .- d)
+        end
     end
 
-    # regression of emission pars to current latent Xs
-    CDd = Y[:, 2:end] / [Xhat[:, 2:end]; cUs_m1; ones(1, N-1)]
-    C = CDd[:, 1:k]
-    D = CDd[:, k+1:end-1]
-    d = CDd[:, end];
+    clds = lds_history[argmin(rmse_history)]
 
-    A, B, b, C, D, d = A |> cT, B |>cT, b |>cT, C |>cT, D |>cT, d |>cT
-    init_LDS(T, A, B, b, C, D, d)
+    # ** DUE TO MAX/MIN CLAMPING OF S.V.s of A, (C, D, d)s may be (very!) suboptimal
+    CDd = Y / [state_rollout(clds, U); U; ones(1, N)]
+
+    clds.C = CDd[:, 1:k]
+    clds.D = CDd[:, k+1:end-1]
+    clds.d = CDd[:, end];
+
+    return_hist ? (clds, rmse_history) : clds
 end
 
 
@@ -207,6 +252,35 @@ end
 (lds::MyLDS_ng)(U) = let X = state_rollout(lds, U); lds.C * X + lds.D * U .+ lds.d; end
 (lds::MyLDS_g)(U)  = let X = state_rollout(lds, U); lds.C * X + lds.D * U .+ lds.d; end
 
-pars(lds::MyLDS_g) = Flux.params(lds.a, lds.B, lds.b, lds.C, lds.D, lds.d) 
+
+function unsup_predict(lds::MyLDS_ng{T}, U::AbstractMatrix{T},
+        YsTrue::AbstractMatrix{T}, standardize_Y::MyStandardScaler,
+        standardize_U::MyStandardScaler, ix_unsup::Int=10) where T <: AbstractFloat
+
+    n = size(U, 2)
+    A = Astable(lds)
+
+    X = Matrix{T}(undef, size(lds, 1), n);
+    Y = Matrix{T}(undef, size(lds, 2), n)
+    u = Vector{T}(undef, size(lds, 3))
+
+    # transform Y -> U
+    μ, σ = standardize_U.μ[61:121], standardize_U.σ[61:121]
+
+    X[:,1] = A*lds.h + lds.B*U[:, 1] + lds.b
+    Y[:,1] = lds.C * X[:,1] + lds.D * U[:,1] .+ lds.d
+    for i in 2:n
+        u = U[:,i]   # I found some unexpected behaviour when using views here.
+        y = (i <= ix_unsup) ? YsTrue[:,i-1] : Y[:,i-1]   # initial state is wrong (0) => need to wash out.
+        y_unnorm = invert(standardize_Y, reshape(y, 1, 64)) |> vec
+        u[61:121] = (y_unnorm[4:64] - μ) ./ σ            # transform to u space
+        @views X[:,i] = A*X[:,i-1] + lds.B*u + lds.b
+        @views Y[:,i] = lds.C * X[:,i] + lds.D * u .+ lds.d
+    end
+    return Y
+end
+
+
+pars(lds::MyLDS_g) = Flux.params(lds.a, lds.B, lds.b, lds.C, lds.D, lds.d)
 
 end   # module end
