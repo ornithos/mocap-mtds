@@ -160,13 +160,20 @@ The named argument `smooth_footc` may be used to smooth the input prior to
 performing the thresholding Dan Holden applies to extract foot contacts. This
 is not done in the original code, and hence its default is 0. The (Int) value
 corresponds to the filter width of the smoother. I recommend ≤ 5.
-"""
-function process_file(filename; smooth_footc::Int=0)
 
+The default frame rate is 60 fps which is used by Holden and Mason (and
+presumably the vision community). However, it may be more convenient for ML work
+to use fps=30. A frame rate in {30,60,120} may be supplied via `fps=...`. Note
+that this should also be supplied to inputs and outputs for the traj. resolution.
+"""
+function process_file(filename; fps::Int=60, smooth_footc::Int=0)
+
+    @argcheck fps in [30,60,120]
     anim, names, frametime = BVHpy.load(filename)
 
     # Subsample to 60 fps
-    anim = get(anim,  range(0, length(anim)-1, step=2))
+    fps_step = Dict(120=>1, 60=>2, 30=>4)[fps]
+    anim = get(anim,  range(0, length(anim)-1, step=fps_step))
 
     # Do FK
     global_xforms = Animpy.transforms_global(anim)  # intermediate
@@ -335,20 +342,25 @@ input tends to make it too easy for the model to obtain trivial predictions. To
 avoid returning any joint_positions in the input matrix, select:
 
     joint_pos=false
+
+If `fps=30` or `fps=120` used in processing, this should also be supplied.
 """
-function construct_inputs(raw; direction=:relative, joint_pos=true)
+function construct_inputs(raw; direction=:relative, joint_pos=true, fps::Int=60)
     X = reconstruct_raw(raw)
-    construct_inputs(X, raw; direction=direction, joint_pos=joint_pos)
+    construct_inputs(X, raw; direction=direction, joint_pos=joint_pos, fps=fps)
 end
 
-function construct_inputs(X, raw; direction=:relative, joint_pos=true)
+function construct_inputs(X, raw; direction=:relative, joint_pos=true, fps::Int=60)
     @argcheck direction in [:relative, :absolute]
+    @argcheck fps in [30,60,120]
     @argcheck size(X)[2:3] == (21, 3)
     @argcheck size(raw, 2) == 196
     @argcheck size(X, 1) == size(raw, 1)
 
     # proc = (N-2)   *  [ rvel (1), xvel (1), zvel (1), feet (4),  pos (63),  vel (63),  rot (63) ]
-    use_ixs = range(70, stop=size(X, 1) - 60)
+    ϝ = fps/60
+    t₀, t₁, Δt = Int(70 * ϝ),  size(X, 1) - Int(60 * ϝ), Int(10 * ϝ)
+    use_ixs = range(t₀, stop=t₁)
     N = length(use_ixs)
     T = eltype(raw)
 
@@ -362,11 +374,11 @@ function construct_inputs(X, raw; direction=:relative, joint_pos=true)
         Xs[:, 62:end] = raw[use_ixs,11:70]
     end
 
-    # Extract -60:10:59 trajectory on a rolling basis
+    # Extract -60:10:59 (or -30:5:29 etc.) trajectory on a rolling basis
     # ---------------------------------------
     for i in 1:12
-        Xs[:,i]    = X[(10:N+9) .+ (i-1)*10, 1, 1]
-        Xs[:,i+12] = X[(10:N+9) .+ (i-1)*10, 1, 3]
+        Xs[:,i]    = X[(Δt:N+Δt-1) .+ (i-1)*Δt, 1, 1]
+        Xs[:,i+12] = X[(Δt:N+Δt-1) .+ (i-1)*Δt, 1, 3]
     end
     Xs[:,1:12] .-= Xs[:,7]
     Xs[:,13:24] .-= Xs[:,19]
@@ -391,17 +403,27 @@ function construct_inputs(X, raw; direction=:relative, joint_pos=true)
 
     # Calculate diff/velocity (i.e. instantaneous dir of traj) / compare with body forward dir
     traj_pos_smooth = filterspy.gaussian_filter1d(X[:,1,[1,3]], 5, axis=0, mode="nearest")
-    traj_vel_xz = traj_pos_smooth[15:end, :] - traj_pos_smooth[5:end-10, :]
-    rel_angle = hcat(reverse(_trigvecs(traj_vel_xz[1:end-5,:], forward[9:end-11, :]))...)  # sinθ, cosθ
+    Δ_½  = Dict(120=>10, 60=>5, 30=>2)[fps]
+    Δ_½r = Dict(120=>0, 60=>0, 30=>1)[fps]
+    # traj_pos_smooth[15:end, :] - traj_pos_smooth[5:end-10, :]
+    traj_vel_xz = traj_pos_smooth[Δt+Δ_½:end, :] - traj_pos_smooth[Δ_½:end-Δt, :]
+    # traj_vel_xz[1:end-5,:], forward[9:end-11, :]
+    # display(traj_vel_xz[1:end-Δ_½,:])
+    # display(forward[(Δt-1):(end-Δt+Δ_½r-1), :])
+    rel_angle = hcat(reverse(_trigvecs(traj_vel_xz[1:end-Δ_½,:], forward[(Δt-1):(end-Δt+Δ_½r-1), :]))...)  # sinθ, cosθ
 
+    # display("Rel angle2     ")
+    # display(size(rel_angle))
     for (r, ix) in enumerate(use_ixs)
-        cvel = view(traj_vel_xz, ix-69:10:ix+41, :)  # note v is +10--> due to +5/-5 differencing
+        v_ixs = (ix+Int(-70 * ϝ)+1):Δt:(ix+Int(40 * ϝ)+1) # note vel is +10--> due to +5/-5 differencing
+        cvel = view(traj_vel_xz, v_ixs, :)
 
         if direction == :relative
-            cangle = view(rel_angle, ix-69:10:ix+41,:)
+            cangle = view(rel_angle, v_ixs,:)
             Xs[r, 25:48] = vec(cangle)
         else
-            cforward = view(forward, ix-60:10:ix+50, :)
+            a_ixs = (ix+Int(-60 * ϝ)):Δt:(ix+Int(50 * ϝ))
+            cforward = view(forward, a_ixs, :)
             Xs[r, 25:48] = vec(cforward)
         end
 
@@ -428,11 +450,20 @@ consistently. This function outputs a matrix with the following columns:
 These are the minimal requirements to reconstruct an animation of human motion
 on the target skeleton. The feet contacts are in {0,1} and may be challenging
 for some linear models, therefore they are optional (see named argument
-    `include_ftcontact` (Bool)).
+    `include_ftcontact`
+(Bool)). Further, if a different frame rate is used for processing, a change in
+trajectory resolution will be required, and hence the amount of padding will
+change. To account for this difference in inputs, supply a `fps=` named
+argument.
+
 """
-function construct_outputs(raw; include_ftcontact=true)
+function construct_outputs(raw; include_ftcontact=true, fps::Int=60)
     @argcheck size(raw, 2) == 196
-    ixs = range(70, stop=size(raw, 1) - 60)
+    @argcheck fps in [30,60,120]
+    ϝ = fps/60
+    t₀, t₁, Δt = Int(70 * ϝ),  size(raw, 1) - Int(60 * ϝ), Int(10 * ϝ)
+
+    ixs = range(t₀, stop=t₁)
     if !include_ftcontact
         return reduce(hcat, (raw[ixs, 1:3], raw[ixs, 9:9], raw[ixs, 11:(63+7)]))
     else
