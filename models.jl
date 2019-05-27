@@ -104,13 +104,31 @@ function init_LDS(A::AbstractMatrix{T}, B::AbstractMatrix{T}, b::AbstractVector{
     init_LDS(T, A, B, b, C, D, d)
 end
 
+function _tikhonov_mrdivide(A, B, λ)
+    a1, a2 = size(A)
+    b1, b2 = size(B)
+    Ã = hcat(A, zeros(eltype(A), a1, b1))
+    B̃ = hcat(B, Matrix(I, b1, b1)*√(λ))
+    Ã / B̃
+end
+
+function _tikhonov_mldivide(A, B, λ)
+    a1, a2 = size(A)
+    b1, b2 = size(B)
+    Ã = vcat(A, Matrix(I, a2, a2)*√(λ))
+    B̃ = vcat(B, zeros(eltype(B), a2, b2))
+    Ã \ B̃
+end
+
+
 function init_LDS_spectral(Y::AbstractMatrix{T}, U::AbstractMatrix{T}, k::Int;
-    max_iter::Int = 4, return_hist::Bool=false) where T <: AbstractFloat
+    max_iter::Int = 4, return_hist::Bool=false, λ::T=T(1e-6)) where T <: AbstractFloat
 
     @argcheck size(Y,2) == size(U,2)
     cT(x) = convert(Array{T}, x)
     rmse(Δ) = sqrt(mean(x->x^2, Δ))
 
+    # Yhankel = reduce(vcat, [Y[:,i:N-p+i] for i in 1:p])  # Hankel didn't make things better
     pc_all = fit(PPCA, Y)
     Xhat = transform(pc_all, Y)[1:k,:];
 
@@ -130,7 +148,8 @@ function init_LDS_spectral(Y::AbstractMatrix{T}, U::AbstractMatrix{T}, k::Int;
     for i = 1:max_iter
         # 1-step cood descent initialised from "cheat": proj. of *current* y_ts
         Xhat = hcat(zeros(T, k, 1), Xhat)   # X starts from zero (i.e index 2 => x_1 etc.)
-        ABb = Xhat[:, 2:N+1] / vcat(Xhat[:, 1:N], U[:,1:N], ones(T, N,1)')
+        ABb = _tikhonov_mrdivide(Xhat[:, 2:N+1], vcat(Xhat[:, 1:N], U[:,1:N], ones(T, N,1)'), λ)
+        # ABb = Xhat[:, 2:N+1] / vcat(Xhat[:, 1:N], U[:,1:N], ones(T, N,1)')
 
         A = ABb[:, 1:k]
         Aeig = eigen(A)
@@ -139,8 +158,8 @@ function init_LDS_spectral(Y::AbstractMatrix{T}, U::AbstractMatrix{T}, k::Int;
         if any(abs.(Aeig.values) .> 1)
             ub = 1.0
             for i in 1:10
-                λ = [v / max(ub, abs(v) + sqrt(eps(T))) for v ∈ Aeig.values]
-                A = real(Aeig.vectors * Diagonal(λ) * Aeig.vectors') |> cT
+                ν = [v / max(ub, abs(v) + sqrt(eps(T))) for v ∈ Aeig.values]
+                A = real(Aeig.vectors * Diagonal(ν) * Aeig.vectors') |> cT
 
                 Aeig = eigen(A)
                 if all(abs.(Aeig.values) .<= 1)
@@ -166,7 +185,8 @@ function init_LDS_spectral(Y::AbstractMatrix{T}, U::AbstractMatrix{T}, k::Int;
         end
 
         # regression of emission pars to current latent Xs
-        CDd = Y / [Xhat[:, 2:N+1]; U; ones(1, N)]
+        # CDd = Y / [Xhat[:, 2:N+1]; U; ones(1, N)]
+        CDd = _tikhonov_mrdivide(Y, [Xhat[:, 2:N+1]; U; ones(1, N)], λ)
         C = CDd[:, 1:k]
         D = CDd[:, k+1:end-1]
         d = CDd[:, end];
@@ -174,21 +194,17 @@ function init_LDS_spectral(Y::AbstractMatrix{T}, U::AbstractMatrix{T}, k::Int;
 
         A, B, b, C, D, d = A |> cT, B |>cT, b |>cT, C |>cT, D |>cT, d |>cT
 
-        lds_history[i] = model.init_LDS(T, A, B, b, C, D, d)
+        lds_history[i] = init_LDS(T, A, B, b, C, D, d)
 
         if i < max_iter
-            Xhat = C \ (Y[:, 1:end] - D*U[:,1:end] .- d)
+            Xhat = _tikhonov_mldivide(C, Y[:, 1:end] - D*U[:,1:end] .- d, λ)
+            # Xhat = C \ (Y[:, 1:end] - D*U[:,1:end] .- d)
         end
     end
 
     clds = lds_history[argmin(rmse_history)]
-
     # ** DUE TO MAX/MIN CLAMPING OF S.V.s of A, (C, D, d)s may be (very!) suboptimal
-    CDd = Y / [state_rollout(clds, U); U; ones(1, N)]
-
-    clds.C = CDd[:, 1:k]
-    clds.D = CDd[:, k+1:end-1]
-    clds.d = CDd[:, end];
+    fit_optimal_obs_params(clds, Y, U; λ=λ)
 
     return_hist ? (clds, rmse_history) : clds
 end
@@ -205,6 +221,26 @@ end
 Astable(s::MyLDS) = Astable(s.a, size(s, 1))
 
 
+function fit_optimal_obs_params(s::MyLDS_g{T}, Y::AbstractMatrix{T},
+    U::AbstractMatrix{T}) where T <: AbstractFloat
+    fit_optimal_obs_params(make_nograd(s), Y, U)
+end
+
+function fit_optimal_obs_params(s::MyLDS_ng{T}, Y::AbstractMatrix{T}, U::AbstractMatrix{T};
+        λ::T=T(1e-6)) where T <: AbstractFloat
+    @argcheck size(U, 2) == size(Y, 2)
+    N = size(Y, 2)
+    k = size(s, 1)
+
+    CDd = _tikhonov_mrdivide(Y, [state_rollout(s, U); U; ones(1, N)], λ)
+    # CDd = Y / [state_rollout(s, U); U; ones(1, N)]
+
+    s.C .= CDd[:, 1:k]
+    s.D .= CDd[:, k+1:end-1]
+    s.d .= CDd[:, end];
+
+    return s
+end
 
 #==============================================================================
     ⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅ LDS Forward Pass ⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅
