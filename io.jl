@@ -494,4 +494,144 @@ function reconstruct_modelled(Y::Matrix)
 end
 
 
+#= -----------------------------------------------------------------------
+                Utilities for accessing data
+   ----------------------------------------------------------------------- =#
+
+mutable struct ExperimentData
+    YsRaw
+    Ys
+    Us
+    ix_lkp
+end
+
+
+"""
+    get_data(s::ExperimentData, ix, splittype, tasktype)
+
+Convenience utility for accessing data stored in an ExperimentData struct.
+Specify the index of the target task, and then select from:
+
+splittype:
+* **:all**        - return the concatentation of all training/validation/test data.
+* **:trainvalid** - return the concatentation of all training/validation data.
+* **:split**      - return individual (3x) outputs for training/validation/test data.
+* **:test**       - return only the test data
+* **:train**      - return only the train data
+* **:valid**      - return only the validation data.
+
+tasktype:
+* **:stl**   - single task model. Return train/validation/test data from this task's data.
+* **:pool**  - pooled/cohort model. Here, training and validation data are from the
+         complement of the selected index, returned in individual wrappers.
+
+Note that in all cases, the output will be (a) Dict(s) containing the following fields:
+
+* **:Y**    - the observation matrix (each column is an observation).
+* **:U**    - the input matrix (each column is a datapoint).
+* **:Yraw** - the raw data before standardisation and another manipulation. (Possibly legacy?)
+"""
+function get_data(s::ExperimentData, ix::Int, splittype::Symbol, tasktype::Symbol,
+        split=[0.7,0.1,0.2])
+    @argcheck splittype ∈ [:all, :trainvalid, :split, :test, :train, :valid]
+    @argcheck tasktype ∈ [:stl, :pool, :pooled]
+    ixs = s.ix_lkp[ix]
+
+    # Get STL data (needed for everything)
+    cYs = reduce(hcat, s.Ys[ixs])
+    cUs = reduce(hcat, s.Us[ixs])
+    cYsraw = reduce(vcat, s.YsRaw[ixs])
+
+    if tasktype == :stl
+        if splittype == :all
+            return Dict(:Y=>cYs, :U=>cUs, :Yraw=>cYsraw)
+        else
+            train, valid, test = create_data_split(cYs, cUs, cYsraw, split);
+            if splittype == :split
+                return train, valid, test
+            elseif splittype == :test
+                return test
+            elseif splittype == :train
+                return train
+            elseif splittype == :valid
+                return valid
+            elseif splittype == :trainvalid
+                return Dict(:Y=>hcat(train[:Y], valid[:Y]),
+                            :U=>hcat(train[:U], valid[:U]),
+                            :Yraw=>hcat(train[:Yraw], valid[:Yraw]))
+            else
+                error("Unreachable error")
+            end
+        end
+    else
+        # Get Pooled test/training set
+        testPool = Dict(:Y=>cYs, :U=>cUs, :Yraw=>cYsraw);
+        ixspool = s.ix_lkp[setdiff(1:length(s.ix_lkp), ix)]
+        trainPool, validPool = Any[], Any[]
+        splitpool = vcat(split[1:2]./sum(split[1:2]), 0)
+
+        if splittype == :all
+            return Dict(:Y=>reduce(hcat, s.Ys),
+                        :U=>reduce(hcat, s.Us),
+                        :Yraw=>reduce(vcat, s.YsRaw))
+        elseif splittype == :trainvalid
+            return Dict(:Y=>reduce(hcat, s.Ys[vcat(ixspool...)]),
+                        :U=>reduce(hcat, s.Us[vcat(ixspool...)]),
+                        :Yraw=>reduce(vcat, s.YsRaw[vcat(ixspool...)]))
+        elseif splittype == :test
+            return testPool
+        end
+
+        for ixs in ixspool
+            cYsraw = reduce(vcat, s.YsRaw[ixs])
+            cYs = reduce(hcat, s.Ys[ixs])
+            cUs = reduce(hcat, s.Us[ixs])
+            _trainPool, _validPool, _ = create_data_split(cYs, cUs, cYsraw, splitpool);
+            push!(trainPool, _trainPool)
+            push!(validPool, _validPool)
+        end
+
+        train, valid, test = create_data_split(cYs, cUs, cYsraw, split);
+        if splittype == :split
+            return trainPool, validPool, testPool
+        elseif splittype == :train
+            return trainPool
+        elseif splittype == :valid
+            return validPool
+        else
+            error("Unreachable error")
+        end
+    end
+end
+
+
+"""
+    create_data_split(Y, U, Yraw, split=[0.7,0.1,0.2])
+
+Create a partition of the data into train/validation/test components. The
+default size of these partitions is 70%/10%/20% respectively. This can be
+switched up by supplying the argument `split=[a, b, c]` s.t. sum(a,b,c) = 1.
+
+It is assumed that *columns* of Y and U contain datapoints, and that *rows* of
+Yraw contain datapoints. The output will be a Dict containing the following fields:
+
+* **:Y**    - the observation matrix (each column is an observation).
+* **:U**    - the input matrix (each column is a datapoint).
+* **:Yrawv - the raw data before standardisation and another manipulation. (Possibly legacy?)
+"""
+function create_data_split(Y, U, Yraw, split=[0.7,0.1,0.2])
+    N = size(Y,2)
+    @argcheck size(Y, 2) == size(U, 2)
+    @argcheck sum(split) == 1
+    int_split = zeros(Int, 3)
+    int_split[1] = Int(round(N*split[1]))
+    int_split[2] = Int(round(N*split[2]))
+    int_split[3] = N - sum(int_split[1:2])
+    split = vcat(0, cumsum(int_split), N) .+1
+    train, valid, test = (Dict(:Y=>Y[:,split[i]:split[i+1]-1],
+                               :U=>U[:,split[i]:split[i+1]-1],
+                               :Yraw=>Yraw[split[i]:split[i+1]-1,:]) for i in 1:3)
+    return train, valid, test
+end
+
 end   # module end
