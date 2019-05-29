@@ -4,7 +4,22 @@ using Flux
 using AxUtil     # (Math: cayley /skew-symm stuff)
 using ArgCheck
 include("./util.jl")
-import .mocaputil: MyStandardScaler, invert
+const MyStandardScalar = mocaputil.MyStandardScalar
+const invert = mocaputil.invert
+
+#==============================================================================
+    ⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅ model utilities ⋅⋅⋅⋅⋅⋅⋅ ⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅
+ =============================================================================#
+
+function zero_grad!(P)
+    for x in P
+        x.grad .= 0
+    end
+end
+
+#==============================================================================
+    ⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅ LDS definition ⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅
+ =============================================================================#
 
 abstract type MyLDS end
 
@@ -33,8 +48,8 @@ Base.eltype(s::MyLDS_ng{T}) where T <: Real = T
 Base.size(s::MyLDS) = (size(s.B, 1), size(s.C, 1), size(s.D, 2))
 Base.size(s::MyLDS, d)::Int = (size(s.B, 1), size(s.C, 1), size(s.D, 2))[d]
 
-Flux.mapleaves(s::MyLDS, f::Function) = typeof(s)(f(s.a), f(s.B), f(s.b), f(s.C), f(s.D), f(s.d), f(s.h))
-Base.copy(s::MyLDS) = Flux.mapleaves(s, deepcopy)
+Flux.mapleaves(f::Function, s::MyLDS) = typeof(s)(f(s.a), f(s.B), f(s.b), f(s.C), f(s.D), f(s.d), f(s.h))
+Base.copy(s::MyLDS) = Flux.mapleaves(deepcopy, s)
 
 has_grad(s::MyLDS_g) = true
 has_grad(s::MyLDS_ng) = false
@@ -49,6 +64,8 @@ function make_nograd(s::MyLDS_g)
     MyLDS_ng{eltype(s)}(f(s.a), f(s.B), f(s.b), f(s.C), f(s.D), f(s.d), f(s.h))
 end
 
+pars(lds::MyLDS_g) = Flux.params(lds.a, lds.B, lds.b, lds.C, lds.D, lds.d)
+ldsparvalues(s::MyLDS) = map(Tracker.data, [s.a, s.B, s.b, s.C, s.D, s.d])
 
 #==============================================================================
     ⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅ LDS constructor / initialiser ⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅
@@ -121,37 +138,41 @@ function _tikhonov_mldivide(A, B, λ)
 end
 
 
-function init_LDS_spectral(Y::AbstractMatrix{T}, U::AbstractMatrix{T}, k::Int;
-    max_iter::Int = 4, return_hist::Bool=false, λ::T=T(1e-6)) where T <: AbstractFloat
+function init_LDS_spectral(Y::AbstractMatrix{T}, U::AbstractMatrix{T}, d_state::Int;
+    max_iter::Int = 4, return_hist::Bool=false, λ::T=T(1e-6), t_ahead::Int=1) where T <: AbstractFloat
 
     @argcheck size(Y,2) == size(U,2)
     cT(x) = convert(Array{T}, x)
     rmse(Δ) = sqrt(mean(x->x^2, Δ))
 
-    # Yhankel = reduce(vcat, [Y[:,i:N-p+i] for i in 1:p])  # Hankel didn't make things better
-    pc_all = fit(PPCA, Y)
-    Xhat = transform(pc_all, Y)[1:k,:];
+    N = size(Y, 2) + 1 - t_ahead
+    d_out, d_in = size(Y, 1), size(U, 1)
 
-    N = size(Y, 2)
-    d_in = size(U, 1)
+    Yhankel = reduce(vcat, [Y[:,i:N+i-1] for i in 1:t_ahead])  # = Y by default.
+    pc_all = fit(PPCA, Yhankel)
+    Xhat = transform(pc_all, Yhankel)[1:d_state,:];
+
+    # define hankel averaging operator for parameters
+    unhankel(x::AbstractMatrix) = mean([x[(i-1)*d_out+1:i*d_out,:] for i in 1:t_ahead])
+    unhankel(x::AbstractVector) = mean([x[(i-1)*d_out+1:i*d_out] for i in 1:t_ahead])
 
     # iterates
     rmse_history = ones(T, max_iter) * Inf
     lds_history = Vector{Any}(undef, max_iter)
 
     # Initialise emission
-    C = projection(pc_all)[:,1:k]
+    C = unhankel(projection(pc_all)[:,1:d_state])
     D = zeros(T, N, d_in)
-    d = mean(pc_all);
+    d = unhankel(mean(pc_all))
 
     # Begin quasi-coordinate descent
     for i = 1:max_iter
         # 1-step cood descent initialised from "cheat": proj. of *current* y_ts
-        Xhat = hcat(zeros(T, k, 1), Xhat)   # X starts from zero (i.e index 2 => x_1 etc.)
+        Xhat = hcat(zeros(T, d_state, 1), Xhat)   # X starts from zero (i.e index 2 => x_1 etc.)
         ABb = _tikhonov_mrdivide(Xhat[:, 2:N+1], vcat(Xhat[:, 1:N], U[:,1:N], ones(T, N,1)'), λ)
         # ABb = Xhat[:, 2:N+1] / vcat(Xhat[:, 1:N], U[:,1:N], ones(T, N,1)')
 
-        A = ABb[:, 1:k]
+        A = ABb[:, 1:d_state]
         Aeig = eigen(A)
 
         # poor man's stable projection
@@ -173,38 +194,49 @@ function init_LDS_spectral(Y::AbstractMatrix{T}, U::AbstractMatrix{T}, k::Int;
         end
 
         # rest of dynamics
-        B = ABb[:,k+1:end-1] |> cT
+        B = ABb[:,d_state+1:end-1] |> cT
         b = ABb[:,end] |> cT
 
         # state rollout
-        Xhat = Matrix{T}(undef, k, N+1);
-        Xhat[:,1] = zeros(T, k)
+        Xhat = Matrix{T}(undef, d_state, N+1);
+        Xhat[:,1] = zeros(T, d_state)
         # remember here that Xhat is zero-based and U is 1-based.
         for i in 1:N
             @views Xhat[:,i+1] = A*Xhat[:,i] + B*U[:,i] + b
         end
 
         # regression of emission pars to current latent Xs
+        postmultA(x, j) = j == 1 ? x : vcat(x, postmultA(x * A, j-1))
         # CDd = Y / [Xhat[:, 2:N+1]; U; ones(1, N)]
-        CDd = _tikhonov_mrdivide(Y, [Xhat[:, 2:N+1]; U; ones(1, N)], λ)
-        C = CDd[:, 1:k]
-        D = CDd[:, k+1:end-1]
-        d = CDd[:, end];
-        rmse_history[i] = rmse(Y - CDd * [Xhat[:, 2:N+1]; U; ones(1, N)])
+        CDd = _tikhonov_mrdivide(Yhankel, [Xhat[:, 2:N+1]; U[:,1:N]; ones(1, N)], λ)
+
+        # # The "correct" thing to do (closer to SSID), but its iterates are poor in this CD scheme.
+        # obsmat = reduce(hcat, [obsmat[(i-1)*64+1:i*64,:] for i in 1:t_ahead])
+        # Â = _tikhonov_mldivide(CDd[65:end,1:20], CDd[1:end-64,1:20], 1f-5)
+        # postmultÂT(x, j) = j == 1 ? x : vcat(x, postmultÂT(x * Â', j-1))
+        # Ĉ = _tikhonov_mrdivide(obsmat, Matrix(postmultÂT(Matrix(I, d_state, d_state), t_ahead)'), 1f-4);
+
+        C = CDd[1:d_out, 1:d_state]
+        D = unhankel(CDd[:, d_state+1:end-1])
+        d = unhankel(CDd[:, end])
+        obs_mat = postmultA(C, t_ahead)
+        rmse_history[i] = rmse(Yhankel - obs_mat * Xhat[:, 2:N+1] - repeat(D, t_ahead) * U[:,1:N] .- repeat(d, t_ahead))
 
         A, B, b, C, D, d = A |> cT, B |>cT, b |>cT, C |>cT, D |>cT, d |>cT
 
         lds_history[i] = init_LDS(T, A, B, b, C, D, d)
 
         if i < max_iter
-            Xhat = _tikhonov_mldivide(C, Y[:, 1:end] - D*U[:,1:end] .- d, λ)
+            input_offset = D*U .+ d
+            inputhankel = reduce(vcat, [input_offset[:,i:N+i-1] for i in 1:t_ahead])
+            Xhat = _tikhonov_mldivide(obs_mat, Yhankel - inputhankel, λ)
             # Xhat = C \ (Y[:, 1:end] - D*U[:,1:end] .- d)
         end
     end
 
     clds = lds_history[argmin(rmse_history)]
     # ** DUE TO MAX/MIN CLAMPING OF S.V.s of A, (C, D, d)s may be (very!) suboptimal
-    fit_optimal_obs_params(clds, Y, U; λ=λ)
+    fit_optimal_obs_params(clds, Y, U; λ=λ, t_ahead=t_ahead)
 
     return_hist ? (clds, rmse_history) : clds
 end
@@ -222,22 +254,27 @@ Astable(s::MyLDS) = Astable(s.a, size(s, 1))
 
 
 function fit_optimal_obs_params(s::MyLDS_g{T}, Y::AbstractMatrix{T},
-    U::AbstractMatrix{T}) where T <: AbstractFloat
-    fit_optimal_obs_params(make_nograd(s), Y, U)
+    U::AbstractMatrix{T}; λ::T=T(1e-6), t_ahead::Int=1) where T <: AbstractFloat
+    fit_optimal_obs_params(make_nograd(s), Y, U; t_ahead=t_ahead)
 end
 
-function fit_optimal_obs_params(s::MyLDS_ng{T}, Y::AbstractMatrix{T}, U::AbstractMatrix{T};
-        λ::T=T(1e-6)) where T <: AbstractFloat
+function fit_optimal_obs_params(s::MyLDS_ng{T}, Y::AbstractMatrix{T},
+    U::AbstractMatrix{T}; λ::T=T(1e-6), t_ahead::Int=1) where T <: AbstractFloat
     @argcheck size(U, 2) == size(Y, 2)
-    N = size(Y, 2)
-    k = size(s, 1)
+    d_out = size(Y, 1)
+    N = size(Y, 2) + 1 - t_ahead
+    d_state = size(s, 1)
 
-    CDd = _tikhonov_mrdivide(Y, [state_rollout(s, U); U; ones(1, N)], λ)
+    Yhankel = reduce(vcat, [Y[:,i:N+i-1] for i in 1:t_ahead])  # = Y by default.
+    unhankel(x::AbstractMatrix) = mean([x[(i-1)*d_out+1:i*d_out,:] for i in 1:t_ahead])
+    unhankel(x::AbstractVector) = mean([x[(i-1)*d_out+1:i*d_out] for i in 1:t_ahead])
+
+    CDd = _tikhonov_mrdivide(Yhankel, [state_rollout(s, U[:,1:N]); U[:,1:N]; ones(1, N)], λ)
     # CDd = Y / [state_rollout(s, U); U; ones(1, N)]
 
-    s.C .= CDd[:, 1:k]
-    s.D .= CDd[:, k+1:end-1]
-    s.d .= CDd[:, end];
+    s.C .= unhankel(CDd[:, 1:d_state])
+    s.D .= unhankel(CDd[:, d_state+1:end-1])
+    s.d .= unhankel(CDd[:, end]);
 
     return s
 end
@@ -317,6 +354,18 @@ function unsup_predict(lds::MyLDS_ng{T}, U::AbstractMatrix{T},
 end
 
 
-pars(lds::MyLDS_g) = Flux.params(lds.a, lds.B, lds.b, lds.C, lds.D, lds.d)
+function kstep_predict(lds::MyLDS_ng{T}, U::AbstractMatrix{T},
+        YsTrue::AbstractMatrix{T}, standardize_Y::MyStandardScaler,
+        standardize_U::MyStandardScaler, ix_unsup::Int=10, k::Int=1) where T <: AbstractFloat
+
+    n = size(U, 2)
+    A = Astable(lds)
+
+    X = Matrix{T}(undef, size(lds, 1), n+1);
+    Y = Matrix{T}(undef, size(lds, 2), n+1-k)
+    u = Vector{T}(undef, size(lds, 3))
+
+    # transform Y -> U
+    μ, σ = standardize_U.μ[61:121], standardize_U.σ[61:121]
 
 end   # module end
