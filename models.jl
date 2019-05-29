@@ -368,4 +368,282 @@ function kstep_predict(lds::MyLDS_ng{T}, U::AbstractMatrix{T},
     # transform Y -> U
     μ, σ = standardize_U.μ[61:121], standardize_U.σ[61:121]
 
+    X[:,1] = zeros(T, size(lds, 1))  # note that X[:,i] := x_{i-1}
+    for i in 1:n+1-k
+        u = U[:,i]   # I found some unexpected behaviour when using views here.
+        @views X[:,i+1] = A*X[:,i-1+1] + lds.B*u + lds.b
+        y = lds.C * X[:,i+1] + lds.D * u .+ lds.d
+        x = X[:, i+1]  # implicit copy
+        for j = 2:k
+            ix = i+j-1    # i already incorporates (+1)
+            u = U[:,ix]   # I found some unexpected behaviour when using views here.
+            y_ = (ix <= ix_unsup) ? YsTrue[:,ix-1] : y   # initial state is wrong (0) => need to wash out.
+            y_unnorm = invert(standardize_Y, reshape(y_, 1, 64)) |> vec
+            u[61:121] = (y_unnorm[4:64] - μ) ./ σ            # transform to u space
+            copy!(x, A*x + lds.B*u + lds.b)
+            y = lds.C * x + lds.D * u .+ lds.d   # no copy! o.w. cannot resize array with shared data (see ternary expr eval=> y)
+        end
+        Y[:, i] = y
+    end
+    return Y
+end
+
+
+
+# #==============================================================================
+#     ⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅ Low Rank LDS definition ⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅
+#  =============================================================================#
+#
+# abstract type LRLDS end
+#
+#
+# mutable struct LRLDS_ng{T} <: LRLDS
+#     a::AbstractVector{T}
+#     B1::AbstractMatrix{T}
+#     B2::AbstractMatrix{T}
+#     b::AbstractVector{T}
+#     C::AbstractMatrix{T}
+#     D1::AbstractMatrix{T}
+#     D2::AbstractMatrix{T}
+#     d::AbstractVector{T}
+#     h::AbstractVector{T}
+# end
+#
+# mutable struct LRLDS_g{T} <: LRLDS
+#     a::TrackedVector{T}
+#     B1::TrackedMatrix{T}
+#     B2::TrackedMatrix{T}
+#     b::TrackedVector{T}
+#     C::TrackedMatrix{T}
+#     D1::TrackedMatrix{T}
+#     D2::TrackedMatrix{T}
+#     d::TrackedVector{T}
+#     h::TrackedVector{T}
+# end
+#
+# Base.eltype(s::LRLDS_g{T}) where T <: Real = T
+# Base.eltype(s::LRLDS_ng{T}) where T <: Real = T
+# Base.size(s::LRLDS) = (size(s.B, 1), size(s.C, 1), size(s.D, 2))
+# Base.size(s::LRLDS, d)::Int = (size(s.B, 1), size(s.C, 1), size(s.D, 2))[d]
+
+
+
+#==============================================================================
+    ⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅ MTLDS definition ⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅
+ =============================================================================#
+
+
+abstract type MTLDS end
+
+mutable struct MTLDS_ng{T, F}  <: MTLDS where {T <: Real, F <: Chain}
+    nn::F
+    a::AbstractVector{T}
+    B::AbstractMatrix{T}
+    b::AbstractVector{T}
+    C::AbstractMatrix{T}
+    D::AbstractMatrix{T}
+    d::AbstractVector{T}
+    h::AbstractVector{T}
+    logσ::AbstractVector{T}
+    function MTLDS_ng(nn,a,B,b,C,D,d,h,logσ)
+        T = eltype(Tracker.data(a))
+        @argcheck T ∈ [Float32, Float64]
+        cT = (T==Float32) ? f32 : f64;
+        nn = cT(nn)
+        new{T,typeof(nn)}(nn,a,B,b,C,D,d,h,logσ)
+    end
+end
+
+mutable struct MTLDS_g{T <: Real, F <: Chain} <: MTLDS
+    nn::F
+    a::TrackedVector{T}
+    B::TrackedMatrix{T}
+    b::TrackedVector{T}
+    C::TrackedMatrix{T}
+    D::TrackedMatrix{T}
+    d::TrackedVector{T}
+    h::TrackedVector{T}
+    logσ::TrackedVector{T}
+    function MTLDS_g(nn,a,B,b,C,D,d,h,logσ)
+        T = eltype(Tracker.data(a))
+        @argcheck T ∈ [Float32, Float64]
+        cT = (T==Float32) ? f32 : f64;
+        nn = cT(nn)
+        new{T,typeof(nn)}(nn,a,B,b,C,D,d,h,logσ)
+    end
+end
+
+Base.eltype(s::MTLDS_g{T, F}) where {T <: Real, F <: Chain} = T
+Base.eltype(s::MTLDS_ng{T, F}) where {T <: Real, F <: Chain} = T
+Base.size(s::MTLDS) where {T <: Int} = (size(s.B, 1), size(s.C, 1), size(s.D, 2))
+Base.size(s::MTLDS, d)::Int = if d==1; size(s.B, 1); elseif d==2; size(s.C, 1); elseif d==3; size(s.D, 2); end
+
+Flux.mapleaves(f::Function, s::MTLDS) = typeof(s)(mapleaves(f, s.nn), f(s.a), f(s.B), f(s.b),
+    f(s.C), f(s.D), f(s.d), f(s.h), f(s.logσ))
+
+Base.copy(s::MTLDS) = Flux.mapleaves(deepcopy, s)
+
+has_grad(s::MTLDS_g) = true
+has_grad(s::MTLDS_ng) = false
+
+Flux.param(f::Function) = f  # need this to permit mapleaves of Flux.param below.
+function make_grad(s::MTLDS_ng)
+    f = Flux.param
+    nn = mapleaves(f, s.nn)
+    MTLDS_g(nn, f(s.a), f(s.B), f(s.b), f(s.C), f(s.D), f(s.d), f(s.h), f(s.logσ))
+end
+
+function make_nograd(s::MTLDS_g)
+    f = Tracker.data
+    nn = mapleaves(f, s.nn)
+    MTLDS_ng(nn, f(s.a), f(s.B), f(s.b), f(s.C), f(s.D), f(s.d), f(s.h), f(s.logσ))
+end
+
+pars(s::MTLDS_g) = Flux.params(s.nn, s.logσ)
+allpars(s::MTLDS_g) = Flux.params(s.nn, s.a, s.B, s.b, s.C, s.D, s.d, s.logσ)
+ldsparvalues(s::MTLDS) = map(Tracker.data, [s.a, s.B, s.b, s.C, s.D, s.d, s.logσ])
+
+zero_grad!(s::MTLDS_g) = zero_grad!(pars(s))
+
+"""
+    make_lds(s::MTLDS, z::AbstractVector)
+
+Create an LDS instance from a multitask LDS given a latent hierarchical variable `z` .
+Notice that the impact of `ψ = nn(z)` impacts *affinely* with the initialised
+parameters a, B, b, C, D, d, logσ.
+"""
+function make_lds(s::Union{MTLDS_g{T,F}, MTLDS_ng{T,F}},
+        z::Union{AbstractVector{T}, TrackedVector{T}}) where {T <: Real, F <: Chain}
+    ψ = s.nn(z)
+    return _make_lds_psi(s, ψ)
+end
+
+function _make_lds_psi(s::Union{MTLDS_g{T,F}, MTLDS_ng{T,F}},
+        ψ::Union{AbstractVector{T}, TrackedVector{T}}) where {T <: Real, F <: Chain}
+    d_state, d_out, d_in = size(s)
+    ldsdims = _partition_ldspars_dims(d_state, d_out, d_in, length(ψ))
+    a, B, b, C, D, d = partition_ldspars(ψ, ldsdims, d_state, d_out, d_in)
+    h = zeros(T, d_state)
+    (ldstype, state) = has_grad(s) ? (MyLDS_g{T}, Flux.param(h)) : (MyLDS_ng{T}, h)
+    return ldstype(a + s.a, B + s.B, b + s.b, C + s.C, D + s.D, d + s.d, state)
+end
+
+function mtldsg_from_lds(s::MyLDS_ng{T}, nn::Chain, logσ::Vector=repeat([exp(1)], size(s,2))) where T
+    Tnn = eltype(Tracker.data(nn[1].W))
+    @assert (Tnn == T) "Ambiguous type. LDS is type $T, but nn is type $Tnn."
+    f = Flux.param
+    MTLDS_g(nn, f(s.a), f(s.B), f(s.b), f(s.C), f(s.D), f(s.d), f(s.h), f(T.(logσ)))
+end
+
+#==============================================================================
+    ⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅ MTLDS utilities  ⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅
+ =============================================================================#
+
+"""
+    get_pars(s::MyLDS)
+    get_pars(s::MTLDS)
+
+Extract all parameters from a given MyLDS/MTLDS (whether tracked or otherwise)
+into a single parameter vector. This is useful for saving the parameter state
+(for instance).
+
+See `set_pars!` to load a given parameter state into an MyLDS/MTLDS object.
+"""
+function get_pars(s::MyLDS)
+    ldspars = vcat(map(vec, map(Tracker.data, [s.a, s.B, s.b, s.C, s.D, s.d]))...)
+    return ldspars
+end
+
+function get_pars(s::MTLDS)
+    nnweights = Tracker.data.(Flux.params(s.nn))
+    nnweights = vcat(map(vec, nnweights)...)
+    ldspars = vcat(map(vec, map(Tracker.data, [s.a, s.B, s.b, s.C, s.D, s.d, s.logσ]))...)
+    return vcat(nnweights, ldspars)
+end
+
+"""
+    set_pars(s::MyLDS, p::AbstractVector)
+    set_pars(s::MTLDS, p::AbstractVector)
+
+Load a parameter vector (corresponding to all parameters in a given MyLDS/MTLDS
+model -- whether tracked or otherwise) into an existing object, `s`. This is useful
+to reset the state of the MTLDS to some previously extracted parameter vector.
+
+See `get_pars` to extract a parameter vector from an MyLDS/MTLDS object.
+"""
+function set_pars!(s::MyLDS, p::Vector)
+    lds_pars = ldsparvalues(s)
+    lds_dims = map(length, lds_pars)
+    @argcheck length(p) == sum(lds_dims)
+
+    # begin setting
+    csz = cumsum([0; lds_dims])
+    for (nn, θ) in enumerate(lds_pars)
+        θ .= reshape(p[(csz[nn]+1):csz[nn+1]], size(θ)...)
+    end
+end
+
+function set_pars!(s::MTLDS, p::Vector)
+    lds_pars = ldsparvalues(s)
+    nnweights = Tracker.data.(Flux.params(s.nn))
+    sz = map(size, nnweights)
+    csz = cumsum([0; map(prod, sz)])
+    lds_dims = map(length, lds_pars)
+    total_d = sum(lds_dims) +  csz[end]
+    @argcheck length(p) == total_d
+
+    # begin setting
+    new_nnweights = [reshape(p[(csz[nn]+1):csz[nn+1]], sz[nn]...) for nn in 1:length(sz)]
+    Flux.loadparams!(s.nn, new_nnweights)
+    csz = cumsum([csz[end]; lds_dims])
+    for (nn, θ) in enumerate(lds_pars)
+        θ .= reshape(p[(csz[nn]+1):csz[nn+1]], size(θ)...)
+    end
+end
+
+
+"""
+    partition_ldspars(s::MTLDS, p::AbstractVector)
+    partition_ldspars(s::LDS, p::AbstractVector)
+    partition_ldspars(p::AbstractVector, dims::AbstractVector{Int}, d_state::Int, d_out::Int, d_in::Int)
+
+Partition an LDS parameter vector (**Note, not an MTLDS parameter vector**) into
+the vector and matrices required for a `MyLDS` object. This was created
+primarily as a useful utility to convert a parameter vector ψ created by the
+hierarhical MTLDS prior into the relevant quantities for an LDS.
+
+There is little overhead in using this function, and all ops are simple index /
+copies that can be backprop-ed through without issue. However, in case of a large
+number of calls, the parameter sizes can be cached (see `_partition_ldspars_dims`)
+in source, and the long form version above may be used.
+"""
+function partition_ldspars(s::Union{MTLDS_g{T,F}, MTLDS_ng{T,F}}, p::Union{AbstractVector{T}, TrackedVector}) where {T,F}
+    d_state, d_out, d_in = size(s)
+    partition_ldspars(p, _partition_ldspars_dims(d_state, d_out, d_in, length(p)), d_state, d_out, d_in)
+end
+
+function partition_ldspars(s::Union{MyLDS_g{T}, MyLDS_ng{T}}, p::Union{AbstractVector{T}, TrackedVector{T}}) where T
+    d_state, d_out, d_in = size(s)
+    partition_ldspars(p, _partition_ldspars_dims(d_state, d_out, d_in, length(p)), d_state, d_out, d_in)
+end
+
+function partition_ldspars(p::Union{AbstractVector, TrackedVector}, dims::AbstractVector,
+        d_state::Int, d_out::Int, d_in::Int)
+    (p[1:dims[1]], reshape(p[dims[1]+1:dims[2]], d_state, d_in), p[dims[2]+1:dims[3]],
+        reshape(p[dims[3]+1:dims[4]], d_out, d_state), reshape(p[dims[4]+1:dims[5]], d_out, d_in),
+        p[dims[5]+1:dims[6]])
+end
+
+function _partition_ldspars_dims(d_state::Int, d_out::Int, d_in::Int, check_length::Int=-1)
+    dims = Vector{Int}(undef, 7)
+    dims[1] = Int((d_state*(d_state+1))/2)
+    dims[2] = dims[1] + d_state * d_in
+    dims[3] = dims[2] + d_state
+    dims[4] = dims[3] + d_out * d_state
+    dims[5] = dims[4] + d_out * d_in
+    dims[6] = dims[5] + d_out
+    check_length > -1 && check_length != dims[6] &&
+        @warn "param vector given is different length ($check_length) to LDS params ($(dims[7]))"
+    return dims
+end
 end   # module end
