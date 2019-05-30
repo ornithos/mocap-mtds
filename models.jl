@@ -1,10 +1,11 @@
 module model
 using StatsBase, LinearAlgebra, MultivariateStats
 using Flux
-using AxUtil     # (Math: cayley /skew-symm stuff)
+using AxUtil     # (Math: cayley /skew-symm stuff), also construct_unique_filename
+using BSON
 using ArgCheck
 include("./util.jl")
-const MyStandardScalar = mocaputil.MyStandardScalar
+const MyStandardScaler = mocaputil.MyStandardScaler
 const invert = mocaputil.invert
 
 #==============================================================================
@@ -445,12 +446,13 @@ mutable struct MTLDS_ng{T, F}  <: MTLDS where {T <: Real, F <: Chain}
     d::AbstractVector{T}
     h::AbstractVector{T}
     logσ::AbstractVector{T}
-    function MTLDS_ng(nn,a,B,b,C,D,d,h,logσ)
+    η_h::T
+    function MTLDS_ng(nn,a,B,b,C,D,d,h,logσ,η_h=0.1)
         T = eltype(Tracker.data(a))
         @argcheck T ∈ [Float32, Float64]
         cT = (T==Float32) ? f32 : f64;
         nn = cT(nn)
-        new{T,typeof(nn)}(nn,a,B,b,C,D,d,h,logσ)
+        new{T,typeof(nn)}(nn,a,B,b,C,D,d,h,logσ,η_h)
     end
 end
 
@@ -464,12 +466,13 @@ mutable struct MTLDS_g{T <: Real, F <: Chain} <: MTLDS
     d::TrackedVector{T}
     h::TrackedVector{T}
     logσ::TrackedVector{T}
-    function MTLDS_g(nn,a,B,b,C,D,d,h,logσ)
+    η_h::T
+    function MTLDS_g(nn,a,B,b,C,D,d,h,logσ,η_h=0.1)
         T = eltype(Tracker.data(a))
         @argcheck T ∈ [Float32, Float64]
         cT = (T==Float32) ? f32 : f64;
         nn = cT(nn)
-        new{T,typeof(nn)}(nn,a,B,b,C,D,d,h,logσ)
+        new{T,typeof(nn)}(nn,a,B,b,C,D,d,h,logσ,η_h)
     end
 end
 
@@ -479,7 +482,7 @@ Base.size(s::MTLDS) where {T <: Int} = (size(s.B, 1), size(s.C, 1), size(s.D, 2)
 Base.size(s::MTLDS, d)::Int = if d==1; size(s.B, 1); elseif d==2; size(s.C, 1); elseif d==3; size(s.D, 2); end
 
 Flux.mapleaves(f::Function, s::MTLDS) = typeof(s)(mapleaves(f, s.nn), f(s.a), f(s.B), f(s.b),
-    f(s.C), f(s.D), f(s.d), f(s.h), f(s.logσ))
+    f(s.C), f(s.D), f(s.d), f(s.h), f(s.logσ), copy(s.η_h))
 
 Base.copy(s::MTLDS) = Flux.mapleaves(deepcopy, s)
 
@@ -490,18 +493,19 @@ Flux.param(f::Function) = f  # need this to permit mapleaves of Flux.param belo
 function make_grad(s::MTLDS_ng)
     f = Flux.param
     nn = mapleaves(f, s.nn)
-    MTLDS_g(nn, f(s.a), f(s.B), f(s.b), f(s.C), f(s.D), f(s.d), f(s.h), f(s.logσ))
+    m = MTLDS_g(nn, f(s.a), f(s.B), f(s.b), f(s.C), f(s.D), f(s.d), f(s.h), f(s.logσ), copy(s.η_h))
+    return m
 end
 
 function make_nograd(s::MTLDS_g)
     f = Tracker.data
     nn = mapleaves(f, s.nn)
-    MTLDS_ng(nn, f(s.a), f(s.B), f(s.b), f(s.C), f(s.D), f(s.d), f(s.h), f(s.logσ))
+    MTLDS_ng(nn, f(s.a), f(s.B), f(s.b), f(s.C), f(s.D), f(s.d), f(s.h), f(s.logσ), copy(s.η_h))
 end
 
 pars(s::MTLDS_g) = Flux.params(s.nn, s.logσ)
 allpars(s::MTLDS_g) = Flux.params(s.nn, s.a, s.B, s.b, s.C, s.D, s.d, s.logσ)
-ldsparvalues(s::MTLDS) = map(Tracker.data, [s.a, s.B, s.b, s.C, s.D, s.d, s.logσ])
+ldsparvalues(s::MTLDS) = map(Tracker.data, [s.a, s.B, s.b, s.C, s.D, s.d, s.logσ, s.η_h])
 
 zero_grad!(s::MTLDS_g) = zero_grad!(pars(s))
 
@@ -512,32 +516,35 @@ Create an LDS instance from a multitask LDS given a latent hierarchical variable
 Notice that the impact of `ψ = nn(z)` impacts *affinely* with the initialised
 parameters a, B, b, C, D, d, logσ.
 """
-function make_lds(s::Union{MTLDS_g{T,F}, MTLDS_ng{T,F}},
-        z::Union{AbstractVector{T}, TrackedVector{T}}) where {T <: Real, F <: Chain}
+function make_lds(s::Union{MTLDS_g{T,F}, MTLDS_ng{T,F}}, z::Union{AbstractVector{T}, TrackedVector{T}},
+        η_hidden::T=T(0.1)) where {T <: Real, F <: Chain}
     ψ = s.nn(z)
-    return _make_lds_psi(s, ψ)
+    return _make_lds_psi(s, ψ, η_hidden)
 end
 
 function _make_lds_psi(s::Union{MTLDS_g{T,F}, MTLDS_ng{T,F}},
-        ψ::Union{AbstractVector{T}, TrackedVector{T}}) where {T <: Real, F <: Chain}
+        ψ::Union{AbstractVector{T}, TrackedVector{T}}, η_h::T=T(0.1)) where {T <: Real, F <: Chain}
     d_state, d_out, d_in = size(s)
     ldsdims = _partition_ldspars_dims(d_state, d_out, d_in, length(ψ))
     a, B, b, C, D, d = partition_ldspars(ψ, ldsdims, d_state, d_out, d_in)
     h = zeros(T, d_state)
     (ldstype, state) = has_grad(s) ? (MyLDS_g{T}, Flux.param(h)) : (MyLDS_ng{T}, h)
-    return ldstype(a + s.a, B + s.B, b + s.b, C + s.C, D + s.D, d + s.d, state)
+    η₁ = s.η_h
+    return ldstype(η₁*a + s.a, η₁*B + s.B, η₁*b + s.b, C + s.C, D + s.D, d + s.d, state)
 end
 
-function mtldsg_from_lds(s::MyLDS_ng{T}, nn::Chain, logσ::Vector=repeat([exp(1)], size(s,2))) where T
+function mtldsg_from_lds(s::MyLDS_ng{T}, nn::Chain, logσ::Vector=repeat([0], size(s,2)), η_h::T=T(0.1)) where T
     Tnn = eltype(Tracker.data(nn[1].W))
     @assert (Tnn == T) "Ambiguous type. LDS is type $T, but nn is type $Tnn."
     f = Flux.param
-    MTLDS_g(nn, f(s.a), f(s.B), f(s.b), f(s.C), f(s.D), f(s.d), f(s.h), f(T.(logσ)))
+    MTLDS_g(nn, f(s.a), f(s.B), f(s.b), f(s.C), f(s.D), f(s.d), f(s.h), f(T.(logσ)), η_h)
 end
 
 #==============================================================================
     ⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅ MTLDS utilities  ⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅
  =============================================================================#
+
+arr2sc(x) = (@argcheck length(x) == 1; x[1])
 
 """
     get_pars(s::MyLDS)
@@ -557,7 +564,7 @@ end
 function get_pars(s::MTLDS)
     nnweights = Tracker.data.(Flux.params(s.nn))
     nnweights = vcat(map(vec, nnweights)...)
-    ldspars = vcat(map(vec, map(Tracker.data, [s.a, s.B, s.b, s.C, s.D, s.d, s.logσ]))...)
+    ldspars = vcat(map(vec, ldsparvalues(s))...)
     return vcat(nnweights, ldspars)
 end
 
@@ -596,7 +603,7 @@ function set_pars!(s::MTLDS, p::Vector)
     new_nnweights = [reshape(p[(csz[nn]+1):csz[nn+1]], sz[nn]...) for nn in 1:length(sz)]
     Flux.loadparams!(s.nn, new_nnweights)
     csz = cumsum([csz[end]; lds_dims])
-    for (nn, θ) in enumerate(lds_pars)
+    for (nn, θ) in enumerate(lds_pars)  # note Tracker.data already called...
         θ .= reshape(p[(csz[nn]+1):csz[nn+1]], size(θ)...)
     end
 end
@@ -616,6 +623,9 @@ There is little overhead in using this function, and all ops are simple index /
 copies that can be backprop-ed through without issue. However, in case of a large
 number of calls, the parameter sizes can be cached (see `_partition_ldspars_dims`)
 in source, and the long form version above may be used.
+
+**Note that unlike `get_pars`/`set_pars`/`save_params` etc., this function does
+NOT return η_h, and is used at present for MTLDS->LDS.**
 """
 function partition_ldspars(s::Union{MTLDS_g{T,F}, MTLDS_ng{T,F}}, p::Union{AbstractVector{T}, TrackedVector}) where {T,F}
     d_state, d_out, d_in = size(s)
@@ -635,7 +645,7 @@ function partition_ldspars(p::Union{AbstractVector, TrackedVector}, dims::Abstra
 end
 
 function _partition_ldspars_dims(d_state::Int, d_out::Int, d_in::Int, check_length::Int=-1)
-    dims = Vector{Int}(undef, 7)
+    dims = Vector{Int}(undef, 6)
     dims[1] = Int((d_state*(d_state+1))/2)
     dims[2] = dims[1] + d_state * d_in
     dims[3] = dims[2] + d_state
@@ -643,7 +653,39 @@ function _partition_ldspars_dims(d_state::Int, d_out::Int, d_in::Int, check_leng
     dims[5] = dims[4] + d_out * d_in
     dims[6] = dims[5] + d_out
     check_length > -1 && check_length != dims[6] &&
-        @warn "param vector given is different length ($check_length) to LDS params ($(dims[7]))"
+        @warn "param vector given is different length ($check_length) to LDS params ($(dims[6]))"
     return dims
 end
+
+
+
+
+#==============================================================================
+    ⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅ disk ops  ⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅
+ =============================================================================#
+
+function save_params(path::String, model::Union{MyLDS, MTLDS}; force=false, verbose=true)
+    !force && isfile(path) && error(format("file {:s} already exists. Use force=true to overwrite.", path))
+    BSON.bson(path, Dict(:model=>string(typeof(model)), :pars=>get_pars(model)))
+    verbose && println("saved at $path")
+end
+
+function save_params(model::Union{MyLDS, MTLDS}; force=false, dir="./data", verbose=true)
+    mnm = match(r"(M.LDS)_.{2}",string(typeof(model)))
+    @assert mnm !== nothing "model given $(string(typeof(model))) does not match MyLDS/MTLDS."
+    filestem = (mnm[1] == "MyLDS") ? "LDS" : mnm[1]
+    filestem *= "_"
+    fname = AxUtil.construct_unique_filename(filestem; path=dir, date_fmt="yyyy_mm_dd", ext=".bson")
+    save_params(fname, model; verbose=true)
+end
+
+function load_params(path::String, model::Union{MyLDS, MTLDS}; force=false)
+    data = BSON.load(path)
+    if data[:model] != string(typeof(model))
+        @warn "model type is different to spec in file ($(string(typeof(model))))"
+        force || error("Unable to load params due to inconsistent model type. If sure, give `force=true`")
+    end
+    set_pars!(model, data[:pars])
+end
+
 end   # module end
