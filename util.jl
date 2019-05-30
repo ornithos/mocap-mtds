@@ -6,13 +6,13 @@ using ArgCheck
 export transform, scale_transform
 export fit
 export invert
-export MyStandardScalar
+export MyStandardScaler
 
 """
     fit(MyStandardScaler, X, dims)
 
 Fit a standardisation to a matrix `X` s.t. that the rows/columns have mean zero and standard deviation 1.
-This operation calculates the mean and standard deviation and outputs a MyStandardScalar object `s` which
+This operation calculates the mean and standard deviation and outputs a MyStandardScaler object `s` which
 allows this same standardisation to be fit to any matrix using `transform(s, Y)` for some matrix `Y`. Note
 that the input matrix `X` is *not* transformed by this operation. Instead use the above `transform` syntax
 on `X`.
