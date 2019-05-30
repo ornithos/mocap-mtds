@@ -498,11 +498,19 @@ end
                 Utilities for accessing data
    ----------------------------------------------------------------------- =#
 
-mutable struct ExperimentData
-    YsRaw
-    Ys
-    Us
+mutable struct ExperimentData{MT <: AbstractMatrix}
+    YsRaw::Vector{MT}
+    Ys::Vector{MT}
+    Us::Vector{MT}
     ix_lkp
+    function ExperimentData(YsRaw, Ys, Us, ix_lkp)
+        MT = unique([typeof(x) for x in YsRaw])[1]
+        YsRaw = [y[2:end,:] for y in YsRaw]  # note that Y, U take 2:end, 1:end-1.
+        YsRaw = convert(Vector{MT}, YsRaw)
+        Ys = convert(Vector{MT}, Ys)
+        Us = convert(Vector{MT}, Us)
+        new{MT}(YsRaw, Ys, Us, ix_lkp)
+    end
 end
 
 
@@ -530,80 +538,129 @@ Note that in all cases, the output will be (a) Dict(s) containing the following 
 * **:Y**    - the observation matrix (each column is an observation).
 * **:U**    - the input matrix (each column is a datapoint).
 * **:Yraw** - the raw data before standardisation and another manipulation. (Possibly legacy?)
+
+Othe kwargs:
+
+* `concat`  - By default, each boundary encountered between files will result in
+a separate Dict, so the return values will be a vector of Dicts. However, for
+more basic models (such as linear regression) with no assumption of temporal
+continuity, it may be simpler to operate on a standard input and output data
+matrix. Setting `concat = true` will return just a single Dict in an array with
+all the data. Choosing `simplify=true` will further remove the array, returning
+only Dicts.
+* `stratified`  - (STL only) stratify the validation/test sets across files in
+each style. By default, the test set will come at the end of the concatenation
+of all files. Stratifying will mean there are L test sets from each of L files.
+For the pooled dataset, the test set is partially stratified, that is, it is
+stratified over the *types* (i.e. a % of each style), but not over the *files*
+within the types. Given that our goal is MTL, this seems appropriate.
+* `split`  - The train/validation/test split as a simplicial 3-dim vector.
+* `simplify` - See `concat`. Used without `concat` this option does nothing.
 """
-function get_data(s::ExperimentData, ix::Int, splittype::Symbol, tasktype::Symbol,
-        split=[0.7,0.1,0.2])
+function get_data(s::ExperimentData, ix::Int, splittype::Symbol, tasktype::Symbol;
+        concat::Bool=false, stratified=false, split=[0.7,0.1,0.2], simplify::Bool=false)
     @argcheck splittype ∈ [:all, :trainvalid, :split, :test, :train, :valid]
     @argcheck tasktype ∈ [:stl, :pool, :pooled]
-    ixs = s.ix_lkp[ix]
-
-    # Get STL data (needed for everything)
-    cYs = reduce(hcat, s.Ys[ixs])
-    cUs = reduce(hcat, s.Us[ixs])
-    cYsraw = reduce(vcat, s.YsRaw[ixs])
-
+    @assert !(stratified && splittype != :stl) "stratified only available for STL. Pooled is 'semi-stratified'(!)"
     if tasktype == :stl
-        if splittype == :all
-            return Dict(:Y=>cYs, :U=>cUs, :Yraw=>cYsraw)
-        else
-            train, valid, test = create_data_split(cYs, cUs, cYsraw, split);
-            if splittype == :split
-                return train, valid, test
-            elseif splittype == :test
-                return test
-            elseif splittype == :train
-                return train
-            elseif splittype == :valid
-                return valid
-            elseif splittype == :trainvalid
-                return Dict(:Y=>hcat(train[:Y], valid[:Y]),
-                            :U=>hcat(train[:U], valid[:U]),
-                            :Yraw=>hcat(train[:Yraw], valid[:Yraw]))
-            else
-                error("Unreachable error")
-            end
-        end
+        get_data_stl(s, ix, splittype; concat=concat, stratified=stratified,
+            split=split, simplify=simplify)
     else
-        # Get Pooled test/training set
-        testPool = Dict(:Y=>cYs, :U=>cUs, :Yraw=>cYsraw);
-        ixspool = s.ix_lkp[setdiff(1:length(s.ix_lkp), ix)]
-        trainPool, validPool = Any[], Any[]
-        splitpool = vcat(split[1:2]./sum(split[1:2]), 0)
-
-        if splittype == :all
-            return Dict(:Y=>reduce(hcat, s.Ys),
-                        :U=>reduce(hcat, s.Us),
-                        :Yraw=>reduce(vcat, s.YsRaw))
-        elseif splittype == :trainvalid
-            return Dict(:Y=>reduce(hcat, s.Ys[vcat(ixspool...)]),
-                        :U=>reduce(hcat, s.Us[vcat(ixspool...)]),
-                        :Yraw=>reduce(vcat, s.YsRaw[vcat(ixspool...)]))
-        elseif splittype == :test
-            return testPool
-        end
-
-        for ixs in ixspool
-            cYsraw = reduce(vcat, s.YsRaw[ixs])
-            cYs = reduce(hcat, s.Ys[ixs])
-            cUs = reduce(hcat, s.Us[ixs])
-            _trainPool, _validPool, _ = create_data_split(cYs, cUs, cYsraw, splitpool);
-            push!(trainPool, _trainPool)
-            push!(validPool, _validPool)
-        end
-
-        train, valid, test = create_data_split(cYs, cUs, cYsraw, split);
-        if splittype == :split
-            return trainPool, validPool, testPool
-        elseif splittype == :train
-            return trainPool
-        elseif splittype == :valid
-            return validPool
-        else
-            error("Unreachable error")
-        end
+        splitpool = split[1:2]./sum(split[1:2])
+        get_data_pooled(s, ix, splittype; concat=concat, split=splitpool, simplify=simplify)
     end
 end
 
+
+function get_data_stl(s::ExperimentData, ix::Int, splittype::Symbol;
+        concat::Bool=false, stratified=false, split=[0.7,0.1,0.2], simplify=false)
+    @argcheck splittype ∈ [:all, :trainvalid, :split, :test, :train, :valid]
+    ixs = s.ix_lkp[ix]
+    stratified = false
+
+    # Get STL data (needed for everything)
+    cYsraw = s.YsRaw[ixs]
+    cYs    = s.Ys[ixs]
+    cUs    = s.Us[ixs]
+
+    if splittype == :all
+        if concat
+            cYsraw, cYs, cUs = _concat(cYsraw, cYs, cUs, simplify);
+        end
+        return _create_y_u_raw_dict(cYs, cUs, cYsraw)
+    end
+
+    Ns     = [size(y, 2) for y in cYs]
+    !stratified && begin; cYsraw, cYs, cUs = _concat(cYsraw, cYs, cUs, false); end
+
+    train, valid, test = create_data_split(cYs, cUs, cYsraw, split);
+    if !stratified && !concat
+        train, valid, test = _unconcatDicts(train, valid, test, Ns)
+    elseif concat
+        train, valid, test = _concatDicts(train, valid, test)
+        if simplify
+            rmv(x) = (length(x) == 1) ? x[1] : x
+            train, valid, test = rmv(train), rmv(valid), rmv(test)
+        end
+    end
+
+    if splittype == :split
+        return train, valid, test
+    elseif splittype == :test
+        return test
+    elseif splittype == :train
+        return train
+    elseif splittype == :valid
+        return valid
+    elseif splittype == :trainvalid
+        return _concatDict([train, valid])
+    else
+        error("Unreachable error")
+    end
+end
+
+
+function get_data_pooled(s::ExperimentData, ix::Int, splittype::Symbol;
+        concat::Bool=false, split=[0.875, 0.125], simplify=false)
+    @argcheck splittype ∈ [:all, :split, :test, :train, :valid]
+    @argcheck length(split) == 2
+
+    # Get STL data (needed for everything)
+    test = get_data_stl(s, ix, :all; concat=concat, stratified=false, simplify=simplify)
+
+    if splittype == :test
+        return test
+    end
+
+    train = Dict[]
+    valid = Dict[]
+
+    for i in setdiff(1:length(s.ix_lkp), ix)
+        _train, _valid, _test = get_data_stl(s, i, :split; concat=concat,
+            stratified=false, split=vcat(split, 0))
+        train = vcat(train, _train)
+        valid = vcat(valid, _valid)
+    end
+
+    if concat
+        train, valid = _concatDicts(train), _concatDicts(valid)
+        if simplify
+            rmv(x) = (length(x) == 1) ? x[1] : x
+            train, valid, test = rmv(train), rmv(valid), rmv(test)
+        end
+    end
+
+    if splittype == :split
+        return train, valid, test
+    elseif splittype == :train
+        return train
+    elseif splittype == :valid
+        return valid
+    else
+        error("Unreachable error")
+    end
+
+end
 
 """
     create_data_split(Y, U, Yraw, split=[0.7,0.1,0.2])
@@ -619,7 +676,7 @@ Yraw contain datapoints. The output will be a Dict containing the following fiel
 * **:U**    - the input matrix (each column is a datapoint).
 * **:Yrawv - the raw data before standardisation and another manipulation. (Possibly legacy?)
 """
-function create_data_split(Y, U, Yraw, split=[0.7,0.1,0.2])
+function create_data_split(Y::Matrix{T}, U::Matrix{T}, Yraw::Matrix{T}, split=[0.7,0.1,0.2]) where T
     N = size(Y,2)
     @argcheck size(Y, 2) == size(U, 2)
     @argcheck sum(split) == 1
@@ -633,5 +690,125 @@ function create_data_split(Y, U, Yraw, split=[0.7,0.1,0.2])
                                :Yraw=>Yraw[split[i]:split[i+1]-1,:]) for i in 1:3)
     return train, valid, test
 end
+
+function create_data_split(Y::Vector{MT}, U::Vector{MT}, Yraw::Vector{MT},
+    split=[0.7,0.1,0.2]) where MT <: AbstractMatrix
+    @argcheck length(Y) == length(U) == length(Yraw)
+    train, valid, test = Dict[], Dict[], Dict[]
+    for i = 1:length(Y)
+        _train, _valid, _test = create_data_split(Y[i], U[i], Yraw[i], split);
+        push!(train, _train)
+        push!(valid, _valid)
+        push!(test, _test)
+    end
+    return train, valid, test
+end
+
+
+#= -----------------------------------------------------------------------
+                Utilities for utilities for accessing data  :S
+    This whole thing got way out of hand. I'm sure this can be tidied up =>
+    is a function of setting out without a plan, under the assumption that
+    "it wouldn't take long". You know what I'm talking about.
+   ----------------------------------------------------------------------- =#
+
+function _concat(Ysraw::Vector{MT}, Ys::Vector{MT}, Us::Vector{MT}, simplify::Bool) where MT <: AbstractMatrix
+    v = simplify ? identity : x -> [x]
+    return v(reduce(vcat, Ysraw)), v(reduce(hcat, Ys)), v(reduce(hcat, Us))
+end
+
+function _concat(trainsplit::Vector{D}, simplify::Bool) where D <: Dict
+    v = simplify ? identity : x -> [x]
+    Ysraw = reduce(vcat, [x[:Yraw] for x in trainsplit])
+    Ys = reduce(hcat, [x[:Y] for x in trainsplit])
+    Us = reduce(hcat, [x[:U] for x in trainsplit])
+    return v(Ysraw), v(Ys), v(Us)
+end
+
+function _concatDicts(trainsplit::Vector{D}) where D <: Dict
+    Ysraw, Ys, Us = _concat(trainsplit, true)
+    return Dict(:Y=>Ys, :U=>Us, :Yraw=>Ysraw)
+end
+
+function _concatDicts(train::Vector{D}, valid::Vector{D}, test::Vector{D}) where D <: Dict
+    train = _concatDicts(train)
+    valid = _concatDicts(valid)
+    test  = _concatDicts(test)
+    return train, valid, test
+end
+
+function _unconcat(Yraw::AbstractMatrix{T}, Y::AbstractMatrix{T}, U::AbstractMatrix{T},
+    breaks::Vector{I}) where {T <: Real, I <: Int}
+
+    N = size(Y,2)
+    @argcheck size(Y, 2) == size(U, 2) == size(Yraw, 1) == sum(breaks)
+    nsplit = length(breaks)
+    split = cumsum([0; breaks]) .+ 1
+    Ys = [Y[:,split[i]:split[i+1]-1] for i in 1:nsplit]
+    Us = [U[:,split[i]:split[i+1]-1] for i in 1:nsplit]
+    Ysraw = [Yraw[split[i]:split[i+1]-1, :] for i in 1:nsplit]
+    return Ysraw, Ys, Us
+end
+
+function _unconcatDict(d::Dict, breaks::Vector{I}) where I <: Int
+    Ysraw, Ys, Us = _unconcat(d[:Yraw], d[:Y], d[:U], breaks)
+    return [Dict(:Y=>y, :U=>u, :Yraw=>yraw) for (y,u,yraw) in zip(Ys, Us, Ysraw)]
+end
+
+# TODO: DRY fail here.
+
+function _unconcatDicts(ds::Vector{D}, breaks::Vector{I}) where {D <: Dict, I <: Int}
+    N = length(ds)
+    Ls = [size(d[:Yraw], 1) for d in ds]
+    @assert sum(Ls) == sum(breaks)
+    bs  = copy(breaks)
+    cbs = cumsum(breaks)
+    out = Dict[]
+    for nn in 1:N
+        ix = something(findlast(cbs .<= Ls[nn]), 0)
+        (ix > 0 && ix < length(bs) && cbs[ix] != Ls[nn]) && (ix += 1)
+        ix = max(ix, 1)
+        cbreaks = bs[1:ix]
+        cbreaks[end] = Ls[nn] - (ix > 1 ? cbs[ix-1] : 0)
+        bs = bs[ix:end]
+        bs[1] -= cbreaks[end]
+        cbs = cbs[ix:end] .- Ls[nn]
+
+        out = vcat(out, _unconcatDict(ds[nn], cbreaks))
+    end
+    return out
+end
+
+function _unconcatDicts(train::Vector{D}, valid::Vector{D}, test::Vector{D},
+    breaks::Vector{I}) where {D <: Dict, I <: Int}
+    Ls = [sum([size(d[:Y], 2) for d in data]) for data in [train, valid, test]]
+    bs  = copy(breaks)
+    cbs = cumsum(breaks)
+    out = []
+    for (nn, data) in enumerate([train, valid, test])
+        ix = something(findlast(cbs .<= Ls[nn]), 0)
+        (ix > 0 && ix < length(bs) && cbs[ix] != Ls[nn]) && (ix += 1)
+        ix = max(ix, 1)
+        cbreaks = bs[1:ix]
+        cbreaks[end] = Ls[nn] - (ix > 1 ? cbs[ix-1] : 0)
+        bs = bs[ix:end]
+        bs[1] -= cbreaks[end]
+        cbs = cbs[ix:end] .- Ls[nn]
+        push!(out, _unconcatDicts(data, cbreaks))
+    end
+    return out[1], out[2], out[3]
+end
+
+
+function _create_y_u_raw_dict(Ys::Vector{MT}, Us::Vector{MT}, Ysraw::Vector{MT}
+    ) where MT <: AbstractMatrix
+    [Dict(:Y=>y, :U=>u, :Yraw=>yraw) for (y,u,yraw) in zip(Ys, Us, Ysraw)]
+end
+
+function _create_y_u_raw_dict(Ys::AbstractMatrix, Us::AbstractMatrix, Ysraw::AbstractMatrix)
+    [Dict(:Y=>Ys, :U=>Us, :Yraw=>Ysraw)]
+end
+
+
 
 end   # module end
