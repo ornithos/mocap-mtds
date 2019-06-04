@@ -158,4 +158,63 @@ end
 removes joint positions from an input array X (returns a copy). See `no_pos`.
 """
 no_poscp(X::AbstractMatrix) = no_pos(X; doCopy=true)
+
+
+#==============================================================================
+    ⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅ Data Iterator  ⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅
+ =============================================================================#
+
+
+struct DataIterator
+    data::Array{D}  where {D <: Dict}
+    batch_size::Int
+    min_size::Int
+    start::Int
+    DataIterator(d, b_sz, m_sz, start) = begin; @assert m_sz < b_sz; new(d, b_sz, m_sz, start); end
+end
+DataIterator(data, batch_size; min_size=1, start=0) = DataIterator(data, batch_size, min_size, start)
+
+function Base.iterate(iter::DataIterator, state=(1, iter.start))
+    element, ix = state
+
+    (element > length(iter.data)) && return nothing
+    new_state = false
+    while ix + iter.min_size > size(iter.data[element][:Y], 2)
+        element += 1
+        ix = iter.start
+        new_state = true
+        (element > length(iter.data)) && return nothing
+    end
+
+    chunk  = iter.data[element]
+    cur_length = size(chunk[:Y], 2)
+    eix  = min(ix + iter.batch_size, cur_length)
+    ix += 1
+
+    return ((chunk[:Y][:,ix:eix], chunk[:U][:,ix:eix], new_state), (element, eix))
+end
+
+function weights(iter::DataIterator; as_pct::Bool=true)
+    w = [size(y,2) for (y, u, new_state) in iter]
+    return as_pct ? w / sum(w) : w
+end
+
+function Base.length(iter::DataIterator)
+    map(iter.data) do x
+        d, r = divrem(size(x[:Y],2)-iter.start, iter.batch_size);
+        d + (r >= iter.min_size);
+        end |> sum
+end
+
+
+#### TESTING
+# tmpiter = mocaputil.DataIterator(trainSTL, 256, min_size=32, start=102);
+# tmp_ii = Int[]
+# for (ii, (_y, _u, new_state)) in enumerate(tmpiter)
+#     @argcheck size(_y, 2) == size(_u, 2)
+#     printfmtln("{:2d}. {:s}Chunk size is: {:d}", ii, new_state ? "(new state) " : "", size(_y, 2))
+#     push!(tmp_ii, ii)
+# end
+# @assert maximum(tmp_ii) == length(tmpiter)
+
 end # module end

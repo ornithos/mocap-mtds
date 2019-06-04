@@ -625,6 +625,13 @@ function get_data_pooled(s::ExperimentData, ix::Int, splittype::Symbol;
     @argcheck splittype ∈ [:all, :split, :test, :train, :valid]
     @argcheck length(split) == 2
 
+    if splittype == :all
+        L = length(s.ix_lkp)
+        all = vcat([get_data_stl(s, i, :all; concat=concat) for i in 1:L]...)
+        rmv = !simplify ? identity : (x-> (length(x) == 1) ? x[1] : x)
+        return !concat ? all : _concatDicts(all)
+    end
+
     # Get STL data (needed for everything)
     test = get_data_stl(s, ix, :all; concat=concat, stratified=false, simplify=simplify)
 
