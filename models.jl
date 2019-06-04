@@ -308,20 +308,49 @@ function state_rollout(lds::MyLDS_g{T}, U::AbstractMatrix{T}) where T <: Abstrac
     return hcat([ldscell(U[:,i]) for i in 1:n]...)
 end
 
+#= BELOW: optimised non-tracked / non-Flux rollout. 2-3x faster than previous
+   version, but this is surprisingly brittle.  The comments in the function
+   denote the sections that are critical for performance. Do not change, since
+   if any of these things change, the performance can degrade not only to its
+   previous level, but also 2-3x *SLOWER* (!). I really have no idea why, or
+   why this is faster than looping over an array without any memcpy. =#
+mutable struct lds_internal_cell{T <: AbstractFloat}
+    x::Vector{T}
+end
 
-function state_rollout(lds::MyLDS_ng{T}, U::AbstractMatrix{T}) where T <: AbstractFloat
+function state_rollout(lds::MyLDS_ng{T}, U::Matrix{T}) where T <: AbstractFloat
     d = size(lds, 1)
     n = size(U, 2)
-    A = Astable(lds)
 
-    X = Matrix{T}(undef, d, n);
-    X[:,1] = A*lds.h + lds.B*U[:, 1] + lds.b
+    hidden = lds_internal_cell{T}(lds.h)
+    A = model.Astable(lds)
+    b = lds.b    # necessary to be declared outside the 'iterate' fn for perf.
+    B = lds.B    # necessary to be declared outside the 'iterate' fn for perf.
 
-    for i in 2:n
-        @views X[:,i] = A*X[:,i-1] + lds.B*U[:, i] + lds.b
+    function iterate(state, u)::Vector{T}
+        state.x = A*state.x + B*u .+ b;       # .+ for b is crucial for perf.
+        state.x
     end
-    return X
+
+    X = [iterate(hidden, view(U, :, t)) for t in 1:n]
+
+    return reduce(hcat, X)
 end
+#
+#
+# function state_rollout(lds::MyLDS_ng{T}, U::AbstractMatrix{T}) where T <: AbstractFloat
+#     d = size(lds, 1)
+#     n = size(U, 2)
+#     A = Astable(lds)
+#
+#     X = Matrix{T}(undef, d, n);
+#     X[:,1] = A*lds.h + lds.B*U[:, 1] + lds.b
+#
+#     for i in 2:n
+#         @views X[:,i] = A*X[:,i-1] + lds.B*U[:, i] + lds.b
+#     end
+#     return X
+# end
 
 (lds::MyLDS_ng)(U) = let X = state_rollout(lds, U); lds.C * X + lds.D * U .+ lds.d; end
 (lds::MyLDS_g)(U)  = let X = state_rollout(lds, U); lds.C * X + lds.D * U .+ lds.d; end
@@ -446,13 +475,14 @@ mutable struct MTLDS_ng{T, F}  <: MTLDS where {T <: Real, F <: Chain}
     d::AbstractVector{T}
     h::AbstractVector{T}
     logσ::AbstractVector{T}
-    η_h::T
+    η_h::Vector{T}
     function MTLDS_ng(nn,a,B,b,C,D,d,h,logσ,η_h=0.1)
         T = eltype(Tracker.data(a))
         @argcheck T ∈ [Float32, Float64]
-        cT = (T==Float32) ? f32 : f64;
-        nn = cT(nn)
-        new{T,typeof(nn)}(nn,a,B,b,C,D,d,h,logσ,η_h)
+        if T != eltype(a)
+            nn = (T==Float32) ? f32(nn) : f64(nn)
+        end
+        new{T,typeof(nn)}(nn,a,B,b,C,D,d,h,logσ,vcat(η_h))
     end
 end
 
@@ -466,13 +496,14 @@ mutable struct MTLDS_g{T <: Real, F <: Chain} <: MTLDS
     d::TrackedVector{T}
     h::TrackedVector{T}
     logσ::TrackedVector{T}
-    η_h::T
+    η_h::Vector{T}
     function MTLDS_g(nn,a,B,b,C,D,d,h,logσ,η_h=0.1)
         T = eltype(Tracker.data(a))
         @argcheck T ∈ [Float32, Float64]
-        cT = (T==Float32) ? f32 : f64;
-        nn = cT(nn)
-        new{T,typeof(nn)}(nn,a,B,b,C,D,d,h,logσ,η_h)
+        if T != eltype(a)
+            nn = (T==Float32) ? f32(nn) : f64(nn)
+        end
+        new{T,typeof(nn)}(nn,a,B,b,C,D,d,h,logσ,vcat(η_h))
     end
 end
 
@@ -481,8 +512,11 @@ Base.eltype(s::MTLDS_ng{T, F}) where {T <: Real, F <: Chain} = T
 Base.size(s::MTLDS) where {T <: Int} = (size(s.B, 1), size(s.C, 1), size(s.D, 2))
 Base.size(s::MTLDS, d)::Int = if d==1; size(s.B, 1); elseif d==2; size(s.C, 1); elseif d==3; size(s.D, 2); end
 
-Flux.mapleaves(f::Function, s::MTLDS) = typeof(s)(mapleaves(f, s.nn), f(s.a), f(s.B), f(s.b),
-    f(s.C), f(s.D), f(s.d), f(s.h), f(s.logσ), copy(s.η_h))
+# mapleaves (not sure how to use the right constructor for generic MTLDS)
+Flux.mapleaves(f::Function, s::MTLDS_ng) = MTLDS_ng(mapleaves(f, s.nn), f(s.a), f(s.B), f(s.b),
+    f(s.C), f(s.D), f(s.d), f(s.h), f(s.logσ), deepcopy(s.η_h))
+Flux.mapleaves(f::Function, s::MTLDS_g) = MTLDS_g(mapleaves(f, s.nn), f(s.a), f(s.B), f(s.b),
+    f(s.C), f(s.D), f(s.d), f(s.h), f(s.logσ), deepcopy(s.η_h))
 
 Base.copy(s::MTLDS) = Flux.mapleaves(deepcopy, s)
 
@@ -493,14 +527,14 @@ Flux.param(f::Function) = f  # need this to permit mapleaves of Flux.param belo
 function make_grad(s::MTLDS_ng)
     f = Flux.param
     nn = mapleaves(f, s.nn)
-    m = MTLDS_g(nn, f(s.a), f(s.B), f(s.b), f(s.C), f(s.D), f(s.d), f(s.h), f(s.logσ), copy(s.η_h))
+    m = MTLDS_g(nn, f(s.a), f(s.B), f(s.b), f(s.C), f(s.D), f(s.d), f(s.h), f(s.logσ), s.η_h)
     return m
 end
 
 function make_nograd(s::MTLDS_g)
     f = Tracker.data
     nn = mapleaves(f, s.nn)
-    MTLDS_ng(nn, f(s.a), f(s.B), f(s.b), f(s.C), f(s.D), f(s.d), f(s.h), f(s.logσ), copy(s.η_h))
+    MTLDS_ng(nn, f(s.a), f(s.B), f(s.b), f(s.C), f(s.D), f(s.d), f(s.h), f(s.logσ), s.η_h)
 end
 
 pars(s::MTLDS_g) = Flux.params(s.nn, s.logσ)
@@ -517,27 +551,28 @@ Notice that the impact of `ψ = nn(z)` impacts *affinely* with the initialised
 parameters a, B, b, C, D, d, logσ.
 """
 function make_lds(s::Union{MTLDS_g{T,F}, MTLDS_ng{T,F}}, z::Union{AbstractVector{T}, TrackedVector{T}},
-        η_hidden::T=T(0.1)) where {T <: Real, F <: Chain}
+        η_hidden::Union{T, Vector{T}}=s.η_h) where {T <: Real, F <: Chain}
     ψ = s.nn(z)
     return _make_lds_psi(s, ψ, η_hidden)
 end
 
 function _make_lds_psi(s::Union{MTLDS_g{T,F}, MTLDS_ng{T,F}},
-        ψ::Union{AbstractVector{T}, TrackedVector{T}}, η_h::T=T(0.1)) where {T <: Real, F <: Chain}
+        ψ::Union{AbstractVector{T}, TrackedVector{T}},
+        η_h::Union{T, Vector{T}}=s.η_h) where {T <: Real, F <: Chain}
     d_state, d_out, d_in = size(s)
     ldsdims = _partition_ldspars_dims(d_state, d_out, d_in, length(ψ))
     a, B, b, C, D, d = partition_ldspars(ψ, ldsdims, d_state, d_out, d_in)
-    h = zeros(T, d_state)
-    (ldstype, state) = has_grad(s) ? (MyLDS_g{T}, Flux.param(h)) : (MyLDS_ng{T}, h)
-    η₁ = s.η_h
-    return ldstype(η₁*a + s.a, η₁*B + s.B, η₁*b + s.b, C + s.C, D + s.D, d + s.d, state)
+    state = deepcopy(s.h)
+    ldstype = has_grad(s) ? MyLDS_g{T} : MyLDS_ng{T}
+    η₁ = arr2sc(s.η_h)
+    return ldstype(η₁*a + s.a, η₁*T(0.1)*B + s.B, η₁*T(0.1)*b + s.b, C + s.C, D + s.D, d + s.d, state)
 end
 
 function mtldsg_from_lds(s::MyLDS_ng{T}, nn::Chain, logσ::Vector=repeat([0], size(s,2)), η_h::T=T(0.1)) where T
     Tnn = eltype(Tracker.data(nn[1].W))
     @assert (Tnn == T) "Ambiguous type. LDS is type $T, but nn is type $Tnn."
     f = Flux.param
-    MTLDS_g(nn, f(s.a), f(s.B), f(s.b), f(s.C), f(s.D), f(s.d), f(s.h), f(T.(logσ)), η_h)
+    MTLDS_g(nn, f(s.a), f(s.B), f(s.b), f(s.C), f(s.D), f(s.d), f(s.h), f(T.(logσ)), vcat(η_h))
 end
 
 #==============================================================================
@@ -545,6 +580,29 @@ end
  =============================================================================#
 
 arr2sc(x) = (@argcheck length(x) == 1; x[1])
+
+function zero_state!(s::Union{model.MyLDS_g, model.MyLDS_ng, model.MTLDS_g, model.MTLDS_ng})
+    h = Tracker.data(s.h)
+    h .= zeros(eltype(s), size(s, 1))
+    return nothing
+end
+
+
+function change_relative_lr!(m::MTLDS_ng{T,F}, η_rel::T) where {T,F}
+    chainpdim = model._partition_ldspars_dims(size(m)...)[3]
+    new_η, old_η = η_rel, m.η_h
+    final_layer = m.nn.layers[end];
+    if final_layer isa Flux.Dense
+        weights, offset = final_layer.W, final_layer.b
+    elseif final_layer isa Flux.Diagonal
+        weights, offset = final_layer.α, final_layer.β
+    else
+        error("Unknown type of final layer ($(typeof(final_layer))). Please add to `change_relative_lr`.")
+    end
+    weights[1:chainpdim, :] .*= old_η / new_η
+    offset[1:chainpdim, :] .*= old_η / new_η
+    m.η_h .= new_η
+end
 
 """
     get_pars(s::MyLDS)
