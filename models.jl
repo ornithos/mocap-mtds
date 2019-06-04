@@ -461,7 +461,8 @@ end
 #==============================================================================
     ⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅ MTLDS definition ⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅
  =============================================================================#
-
+eltype2(x::Tracker.TrackedReal{T}) where T <: Real = T
+eltype2(x::T) where T <: Real = T
 
 abstract type MTLDS end
 
@@ -475,11 +476,11 @@ mutable struct MTLDS_ng{T, F}  <: MTLDS where {T <: Real, F <: Chain}
     d::AbstractVector{T}
     h::AbstractVector{T}
     logσ::AbstractVector{T}
-    η_h::Vector{T}
+    η_h::AbstractVector{T}
     function MTLDS_ng(nn,a,B,b,C,D,d,h,logσ,η_h=0.1)
         T = eltype(Tracker.data(a))
         @argcheck T ∈ [Float32, Float64]
-        if T != eltype(a)
+        if T != eltype2(nn.layers[1].W[1])
             nn = (T==Float32) ? f32(nn) : f64(nn)
         end
         new{T,typeof(nn)}(nn,a,B,b,C,D,d,h,logσ,vcat(η_h))
@@ -496,11 +497,11 @@ mutable struct MTLDS_g{T <: Real, F <: Chain} <: MTLDS
     d::TrackedVector{T}
     h::TrackedVector{T}
     logσ::TrackedVector{T}
-    η_h::Vector{T}
+    η_h::AbstractVector{T}
     function MTLDS_g(nn,a,B,b,C,D,d,h,logσ,η_h=0.1)
         T = eltype(Tracker.data(a))
         @argcheck T ∈ [Float32, Float64]
-        if T != eltype(a)
+        if T != eltype2(nn.layers[1].W[1])
             nn = (T==Float32) ? f32(nn) : f64(nn)
         end
         new{T,typeof(nn)}(nn,a,B,b,C,D,d,h,logσ,vcat(η_h))
@@ -620,7 +621,7 @@ function get_pars(s::MyLDS)
 end
 
 function get_pars(s::MTLDS)
-    nnweights = Tracker.data.(Flux.params(s.nn))
+    nnweights = Tracker.data.(params2(s.nn))
     nnweights = vcat(map(vec, nnweights)...)
     ldspars = vcat(map(vec, ldsparvalues(s))...)
     return vcat(nnweights, ldspars)
@@ -650,7 +651,7 @@ end
 
 function set_pars!(s::MTLDS, p::Vector)
     lds_pars = ldsparvalues(s)
-    nnweights = Tracker.data.(Flux.params(s.nn))
+    nnweights = Tracker.data.(params2(s.nn))
     sz = map(size, nnweights)
     csz = cumsum([0; map(prod, sz)])
     lds_dims = map(length, lds_pars)
@@ -666,6 +667,19 @@ function set_pars!(s::MTLDS, p::Vector)
     end
 end
 
+"""
+    params2(model)
+
+Like `params` function in Flux, except returns parameters regardless whether
+they are tracked or not.
+"""
+function params2(m)
+  ps = []
+  Flux.prefor(p ->
+    Tracker.isleaf(p) && !any(p′ -> p′ === p, ps) && push!(ps, p),
+    m)
+  return ps
+end
 
 """
     partition_ldspars(s::MTLDS, p::AbstractVector)
