@@ -242,7 +242,6 @@ function init_LDS_spectral(Y::AbstractMatrix{T}, U::AbstractMatrix{T}, d_state::
     return_hist ? (clds, rmse_history) : clds
 end
 
-
 function Astable(ψ, d)
     n_skew = Int(d*(d-1)/2)
     x_S, x_V = ψ[1:d], ψ[d+1:d+n_skew]
@@ -515,9 +514,9 @@ Base.size(s::MTLDS, d)::Int = if d==1; size(s.B, 1); elseif d==2; size(s.C, 1); 
 
 # mapleaves (not sure how to use the right constructor for generic MTLDS)
 Flux.mapleaves(f::Function, s::MTLDS_ng) = MTLDS_ng(mapleaves(f, s.nn), f(s.a), f(s.B), f(s.b),
-    f(s.C), f(s.D), f(s.d), f(s.h), f(s.logσ), deepcopy(s.η_h))
+    f(s.C), f(s.D), f(s.d), f(s.h), f(s.logσ), f(s.η_h))
 Flux.mapleaves(f::Function, s::MTLDS_g) = MTLDS_g(mapleaves(f, s.nn), f(s.a), f(s.B), f(s.b),
-    f(s.C), f(s.D), f(s.d), f(s.h), f(s.logσ), deepcopy(s.η_h))
+    f(s.C), f(s.D), f(s.d), f(s.h), f(s.logσ), f(s.η_h))
 
 Base.copy(s::MTLDS) = Flux.mapleaves(deepcopy, s)
 
@@ -575,6 +574,9 @@ function mtldsg_from_lds(s::MyLDS_ng{T}, nn::Chain, logσ::Vector=repeat([0], si
     f = Flux.param
     MTLDS_g(nn, f(s.a), f(s.B), f(s.b), f(s.C), f(s.D), f(s.d), f(s.h), f(T.(logσ)), vcat(η_h))
 end
+
+
+Flux.gpu(x::MTLDS) = mapleaves(gpu, x)
 
 #==============================================================================
     ⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅ MTLDS utilities  ⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅
@@ -649,7 +651,7 @@ function set_pars!(s::MyLDS, p::Vector)
     end
 end
 
-function set_pars!(s::MTLDS, p::Vector)
+function set_pars!(s::MTLDS_g, p::Vector)
     lds_pars = ldsparvalues(s)
     nnweights = Tracker.data.(params2(s.nn))
     sz = map(size, nnweights)
@@ -676,7 +678,7 @@ they are tracked or not.
 function params2(m)
   ps = []
   Flux.prefor(p ->
-    Tracker.isleaf(p) && !any(p′ -> p′ === p, ps) && push!(ps, p),
+    p isa AbstractArray && Tracker.isleaf(p) && !any(p′ -> p′ === p, ps) && push!(ps, p),
     m)
   return ps
 end

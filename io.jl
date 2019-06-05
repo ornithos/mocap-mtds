@@ -222,7 +222,7 @@ function process_file(filename; fps::Int=60, smooth_footc::Int=0)
     across = across0 + across1
     across = across ./ sqrt.(sum(x->x^2, across, dims=2))
 
-    direction_filterwidth = 20
+    direction_filterwidth = ceil(Int, 20 * fps/80)
 #     forward = [cross(view(across, i,:), [0., 1, 0])' for i in 1:N] |>  x->reduce(vcat, x)  # crossprod
     forward = hcat(-across[:,3], zeros(size(across, 1), 1), across[:,1])  # crossprod (easy as spec. case)
     forward = filterspy.gaussian_filter1d(forward, direction_filterwidth, axis=0, mode="nearest")
@@ -306,7 +306,7 @@ end
 
 
 """
-    construct_inputs(raw [; direction=:relative, joint_pos=true])
+    construct_inputs(raw [; direction=:relative, joint_pos=true, include_ftcontact=false])
 
 Construct the input matrix for the mocap models. The input `raw` is the raw
 output from the `process_file` function. The function outputs the following
@@ -326,6 +326,7 @@ The following columns are contained in the matrix:
 * (12): ± 60 frame trajectory angle cos(θ) to forward
 * (12): ± 60 frame trajectory magnitude of velocity
 * (61): joint positions in Lagrangian frame (optional)
+* (4) : foot contacts (calc. by threshold), [L ball, L toe, R ball, R toe] (optional).
 
 The angle θ is expressed in both sine and cosine components to avoid a
 discontinuity when it wraps around 2π (which it sometimes does). This angle
@@ -345,12 +346,15 @@ avoid returning any joint_positions in the input matrix, select:
 
 If `fps=30` or `fps=120` used in processing, this should also be supplied.
 """
-function construct_inputs(raw; direction=:relative, joint_pos=true, fps::Int=60)
+function construct_inputs(raw; direction=:relative, joint_pos=true,
+        fps::Int=60, include_ftcontact=false)
     X = reconstruct_raw(raw)
-    construct_inputs(X, raw; direction=direction, joint_pos=joint_pos, fps=fps)
+    construct_inputs(X, raw; direction=direction, joint_pos=joint_pos, fps=fps,
+        include_ftcontact=include_ftcontact)
 end
 
-function construct_inputs(X, raw; direction=:relative, joint_pos=true, fps::Int=60)
+function construct_inputs(X, raw; direction=:relative, joint_pos=true,
+        fps::Int=60, include_ftcontact=false)
     @argcheck direction in [:relative, :absolute]
     @argcheck fps in [30,60,120]
     @argcheck size(X)[2:3] == (21, 3)
@@ -366,12 +370,17 @@ function construct_inputs(X, raw; direction=:relative, joint_pos=true, fps::Int=
 
     # traj_pos (12x2), abs./rel. direction (12x2), abs. velocity (12), joint positions (63)
     jpnum = joint_pos ? 61 : 0
-    Xs = Matrix{T}(undef, N, 48 + 12 + jpnum)
+    ftnum = include_ftcontact ? 4 : 0
+    Xs = Matrix{T}(undef, N, 48 + 12 + jpnum + ftnum)
 
     # add rel. pos from raw
     if joint_pos
         Xs[:, 61] = raw[use_ixs,9]          # x,z value of root are always zero
-        Xs[:, 62:end] = raw[use_ixs,11:70]
+        Xs[:, 62:62+59] = raw[use_ixs,11:70]
+    end
+
+    if include_ftcontact
+        Xs[:, (60 + joint_pos*61) .+ (1:4)] = raw[use_ixs, 4:7]
     end
 
     # Extract -60:10:59 (or -30:5:29 etc.) trajectory on a rolling basis
