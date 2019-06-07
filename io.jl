@@ -306,7 +306,8 @@ end
 
 
 """
-    construct_inputs(raw [; direction=:relative, joint_pos=true, include_ftcontact=false])
+    construct_inputs(raw [; direction=:relative, joint_pos=true,
+    fps=60, include_ftcontact=false, include_ftmid=false])
 
 Construct the input matrix for the mocap models. The input `raw` is the raw
 output from the `process_file` function. The function outputs the following
@@ -315,18 +316,21 @@ excluding approx. the first and last second. This is in order to construct
 trajectories that extend ± 60 frames of the current position. (The additional is
 due to needing a bit extra to calculate velocity, plus some historical baggage.)
 Note also that the trajectory is centered at every frame at the current position
-and hence `(trajectory_x(7), trajectory_z(7)) == (0.0, 0.0)`.
+and hence `(trajectory_x(7), trajectory_z(7)) == (0.0, 0.0)`. This all assumes a
+fps of 60. If a different fps is extracted (30 or 120), specify `fps=30` or `fps=120`.
 
 
 The following columns are contained in the matrix:
 
 * (12): ± 60 frame trajectory x-cood at step 10 intervals
 * (12): ± 60 frame trajectory z-cood at step 10 intervals
-* (12): ± 60 frame trajectory angle sin(θ) to forward
-* (12): ± 60 frame trajectory angle cos(θ) to forward
+* (12): ± 60 frame trajectory body angle sin(θ) to forward
+* (12): ± 60 frame trajectory body angle cos(θ) to forward
 * (12): ± 60 frame trajectory magnitude of velocity
+* (12): ± 60 frame trajectory path angle to root. (Derived from x/z above.)
 * (61): joint positions in Lagrangian frame (optional)
 * (4) : foot contacts (calc. by threshold), [L ball, L toe, R ball, R toe] (optional).
+* (4) : foot contacts midpoints (see above; midpoint of each interval as binary indicator)
 
 The angle θ is expressed in both sine and cosine components to avoid a
 discontinuity when it wraps around 2π (which it sometimes does). This angle
@@ -340,21 +344,28 @@ are excluded, as they are always zero. They're excluded from the output too,
 which is more important: we don't want to waste strength on predicting zero. In
 most of my experiments, I have found that including the joint positions in the
 input tends to make it too easy for the model to obtain trivial predictions. To
-avoid returning any joint_positions in the input matrix, select:
+avoid returning any joint positions in the input matrix, select `joint_pos=false`.
 
-    joint_pos=false
-
-If `fps=30` or `fps=120` used in processing, this should also be supplied.
+However since trajectory information contains no information about the phase of the
+movement, this ambiguity cannot be resolved by the model, leading to averaged
+dynamics. To resolve this, I've moved back in the direction of Holden's PFNN, but
+calculating the phase is problematic, particularly during sharp turns and standing;
+we can instead supply the foot contacts directly to the model. Use `include_ftcontact=true`.
+This feature has a drawback of heavy-footed locomotion (clompy walking!) due to the
+length of foot contact intervals. A simple alternative is to include the
+midpoint of each interval to allow differentiation of foot-up, foot-down. Specify
+using `include_ftmid=true`. (I still want to eschew deriving a phase signal: even
+in the locomotion data, this is often confused, and is anyway derived from foot contacts.)
 """
 function construct_inputs(raw; direction=:relative, joint_pos=true,
-        fps::Int=60, include_ftcontact=false)
+        fps::Int=60, include_ftcontact=false, include_ftmid=false)
     X = reconstruct_raw(raw)
     construct_inputs(X, raw; direction=direction, joint_pos=joint_pos, fps=fps,
-        include_ftcontact=include_ftcontact)
+        include_ftcontact=include_ftcontact, include_ftmid=include_ftmid)
 end
 
 function construct_inputs(X, raw; direction=:relative, joint_pos=true,
-        fps::Int=60, include_ftcontact=false)
+        fps::Int=60, include_ftcontact=false, include_ftmid=false)
     @argcheck direction in [:relative, :absolute]
     @argcheck fps in [30,60,120]
     @argcheck size(X)[2:3] == (21, 3)
@@ -371,16 +382,25 @@ function construct_inputs(X, raw; direction=:relative, joint_pos=true,
     # traj_pos (12x2), abs./rel. direction (12x2), abs. velocity (12), joint positions (63)
     jpnum = joint_pos ? 61 : 0
     ftnum = include_ftcontact ? 4 : 0
-    Xs = Matrix{T}(undef, N, 48 + 12 + jpnum + ftnum)
+    ftmnum = include_ftmid ? 4 : 0
+    Xs = Matrix{T}(undef, N, 48 + 24 + jpnum + ftnum + ftmnum)
 
     # add rel. pos from raw
     if joint_pos
-        Xs[:, 61] = raw[use_ixs,9]          # x,z value of root are always zero
-        Xs[:, 62:62+59] = raw[use_ixs,11:70]
+        Xs[:, 72+1] = raw[use_ixs,9]          # x,z value of root are always zero
+        Xs[:, 74:74+59] = raw[use_ixs,11:70]
     end
 
     if include_ftcontact
-        Xs[:, (60 + joint_pos*61) .+ (1:4)] = raw[use_ixs, 4:7]
+        Xs[:, (72 + joint_pos*61) .+ (1:4)] = raw[use_ixs, 4:7]
+    end
+
+    if include_ftmid
+        extra = zeros(T, N, 4)
+        Xix2 = 72 + joint_pos*61 + include_ftcontact*4
+        for j in 1:4
+            Xs[:, Xix2 + j] = mid_footcontact(raw[use_ixs, 4+j-1])
+        end
     end
 
     # Extract -60:10:59 (or -30:5:29 etc.) trajectory on a rolling basis
@@ -438,7 +458,31 @@ function construct_inputs(X, raw; direction=:relative, joint_pos=true,
 
         Xs[r, 49:60] = sqrt.(sum(x->x^2, cvel, dims=2)[:])
     end
+
+    Xs[:, 61:72] = atan.(Xs[:, 1:12], Xs[:, 13:24])
+
     return Xs
+end
+
+
+function mid_footcontact!(out, u)
+    counter=0
+    for i in 1:length(u)
+        if u[i] == 0
+            if counter > 0
+                back = floor(Int, counter/2)+1
+                out[i-back] = 1
+                counter = 0
+            end
+            continue
+        end
+        counter += 1
+    end
+    return out
+end
+
+function mid_footcontact(u)
+    mid_footcontact!(fill!(similar(u), 0), u)
 end
 
 
