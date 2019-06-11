@@ -3,6 +3,8 @@ module mocaputil
 using StatsBase, Statistics, MultivariateStats
 using ArgCheck
 
+import Random: shuffle
+
 export transform, scale_transform
 export fit
 export invert
@@ -178,13 +180,12 @@ function Base.iterate(iter::DataIterator, state=(1, iter.start))
     element, ix = state
 
     (element > length(iter.data)) && return nothing
-    new_state = false
     while ix + iter.min_size > size(iter.data[element][:Y], 2)
         element += 1
         ix = iter.start
-        new_state = true
         (element > length(iter.data)) && return nothing
     end
+    new_state = ix == iter.start   # not in while, since 1st iterate in general won't use this loop.
 
     chunk  = iter.data[element]
     cur_length = size(chunk[:Y], 2)
@@ -206,6 +207,10 @@ function Base.length(iter::DataIterator)
         end |> sum
 end
 
+function shuffle(di::mocaputil.DataIterator)
+    newdata = shuffle([Dict(:Y=>cY, :U=>cU) for (cY, cU, h0) in di])
+    mocaputil.DataIterator(newdata, di.batch_size, 1, di.start)
+end
 
 #### TESTING
 # tmpiter = mocaputil.DataIterator(trainSTL, 256, min_size=32, start=102);
