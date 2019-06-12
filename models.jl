@@ -484,7 +484,7 @@ pars_no_inpnn(s::ORNN_g)  = Flux.params(s.a, s.B, s.b, s.C, s.D, s.d)
 function build_rnn!(rnn::Flux.Recur, m::Union{ORNN_g, ORNN_ng})
     rnn.cell.Wi = m.B
     rnn.cell.b = m.b
-    rnn.cell.Wh = Astable(m.a, d_state)
+    rnn.cell.Wh = Astable(m.a, size(m, 1))
     rnn
 end
 
