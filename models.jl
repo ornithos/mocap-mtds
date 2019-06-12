@@ -68,6 +68,11 @@ end
 pars(lds::MyLDS_g) = Flux.params(lds.a, lds.B, lds.b, lds.C, lds.D, lds.d)
 ldsparvalues(s::MyLDS) = map(Tracker.data, [s.a, s.B, s.b, s.C, s.D, s.d])
 
+function zero!(lds::MyLDS)
+    map(ldsparvalues(lds)) do p
+        p .= 0
+    end
+end
 #==============================================================================
     ⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅ LDS constructor / initialiser ⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅
  =============================================================================#
@@ -322,7 +327,7 @@ function state_rollout(lds::MyLDS_ng{T}, U::Matrix{T}) where T <: AbstractFloat
     n = size(U, 2)
 
     hidden = lds_internal_cell{T}(lds.h)
-    A = model.Astable(lds)
+    A = Astable(lds)
     b = lds.b    # necessary to be declared outside the 'iterate' fn for perf.
     B = lds.B    # necessary to be declared outside the 'iterate' fn for perf.
 
@@ -419,43 +424,107 @@ end
 
 
 
-# #==============================================================================
-#     ⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅ Low Rank LDS definition ⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅
-#  =============================================================================#
-#
-# abstract type LRLDS end
-#
-#
-# mutable struct LRLDS_ng{T} <: LRLDS
-#     a::AbstractVector{T}
-#     B1::AbstractMatrix{T}
-#     B2::AbstractMatrix{T}
-#     b::AbstractVector{T}
-#     C::AbstractMatrix{T}
-#     D1::AbstractMatrix{T}
-#     D2::AbstractMatrix{T}
-#     d::AbstractVector{T}
-#     h::AbstractVector{T}
-# end
-#
-# mutable struct LRLDS_g{T} <: LRLDS
-#     a::TrackedVector{T}
-#     B1::TrackedMatrix{T}
-#     B2::TrackedMatrix{T}
-#     b::TrackedVector{T}
-#     C::TrackedMatrix{T}
-#     D1::TrackedMatrix{T}
-#     D2::TrackedMatrix{T}
-#     d::TrackedVector{T}
-#     h::TrackedVector{T}
-# end
-#
-# Base.eltype(s::LRLDS_g{T}) where T <: Real = T
-# Base.eltype(s::LRLDS_ng{T}) where T <: Real = T
-# Base.size(s::LRLDS) = (size(s.B, 1), size(s.C, 1), size(s.D, 2))
-# Base.size(s::LRLDS, d)::Int = (size(s.B, 1), size(s.C, 1), size(s.D, 2))[d]
+#==============================================================================
+    ⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅ ORNN definition ⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅
+ =============================================================================#
 
+ abstract type ORNN end
 
+ mutable struct ORNN_ng{T,F,C} <: ORNN
+     a::AbstractVector{T}
+     B::AbstractMatrix{T}
+     b::AbstractVector{T}
+     h::AbstractVector{T}
+     C::AbstractMatrix{T}
+     D::AbstractMatrix{T}
+     d::AbstractVector{T}
+     σ::F
+     inpnn::C
+ end
+
+ mutable struct ORNN_g{T,F,C} <: ORNN
+     a::TrackedVector{T}
+     B::TrackedMatrix{T}
+     b::TrackedVector{T}
+     h::TrackedVector{T}
+     C::TrackedMatrix{T}
+     D::TrackedMatrix{T}
+     d::TrackedVector{T}
+     σ::F
+     inpnn::C
+ end
+
+Base.eltype(s::ORNN_g{T,F,C}) where {T <: Real, F, C} = T
+Base.eltype(s::ORNN_ng{T,F,C}) where {T <: Real, F, C} = T
+Base.size(s::ORNN) = (size(s.B, 1), size(s.C, 1), size(s.B, 2))
+Base.size(s::ORNN, d)::Int = (size(s.B, 1), size(s.C, 1), size(s.B, 2))[d]
+
+has_grad(s::ORNN_g) = true
+has_grad(s::ORNN_ng) = false
+
+Flux.mapleaves(f::Function, s::ORNN) = typeof(s)(f(s.a), f(s.B), f(s.b), f(s.h), f(s.C), f(s.D), f(s.d),
+    s.σ, mapleaves(f, s.inpnn))
+Base.copy(s::ORNN) = Flux.mapleaves(deepcopy, s)
+
+function make_grad(s::ORNN_ng{T,F,C}) where {T,F,C}
+    f = Flux.param
+    inpnn = mapleaves(f, s.inpnn)
+    ORNN_g{T,F,typeof(inpnn)}(f(s.a), f(s.B), f(s.b), f(s.h), f(s.C), f(s.D), f(s.d), s.σ, inpnn)
+end
+
+function make_nograd(s::ORNN_g{T,F,C}) where {T,F,C}
+    f = Tracker.data
+    inpnn = mapleaves(f, s.inpnn)
+    ORNN_ng{T,F,typeof(inpnn)}(f(s.a), f(s.B), f(s.b), f(s.h), f(s.C), f(s.D), f(s.d), s.σ, inpnn)
+end
+
+pars(s::ORNN_g) = Flux.params(s.a, s.B, s.b, s.C, s.D, s.d, Flux.params(inpnn)...)
+pars_no_inpnn(s::ORNN_g)  = Flux.params(s.a, s.B, s.b, s.C, s.D, s.d)
+
+function build_rnn!(rnn::Flux.Recur, m::Union{ORNN_g, ORNN_ng})
+    rnn.cell.Wi = m.B
+    rnn.cell.b = m.b
+    rnn.cell.Wh = Astable(m.a, d_state)
+    rnn
+end
+
+function build_rnn(m::ORNN_g)
+    d_state, d_out, d_in = size(m)
+    build_rnn!(RNN(d_in, d_state, m.σ), m)
+end
+
+function build_rnn(m::ORNN_ng)
+    d_state, d_out, d_in = size(m)
+    build_rnn!(mapleaves(Tracker.data, RNN(d_in, d_state, m.σ)), m)
+end
+
+function eval_ornn(m::Union{ORNN_g, ORNN_ng}, U)
+    rnn = build_rnn(m)
+    x̂ = Tracker.collect(reduce(hcat, [rnn(U[:,i]) for i in 1:size(_U,2)]))
+    return m.C*x̂ + m.D*U .+ m.d
+end
+
+(m::ORNN_g)(U) = eval_ornn(m, U)
+(m::ORNN_ng)(U) = eval_ornn(m, U)
+
+function make_rnn_psi!(ornn::Union{ORNN_g{T,F,Q}, ORNN_ng{T,F,Q}},
+        ψ::Union{AbstractVector{T}, TrackedVector{T}},
+        η_h::Union{T, Vector{T}}=T(0.1)) where {T, F, Q}
+    d_state, d_out, d_in = size(ornn)
+    @assert !xor(model.has_grad(ornn), Tracker.istracked(ψ)) "req. both tracked or untracked"
+    ldsdims = model._partition_ldspars_dims(d_state, d_out, d_in, length(ψ))
+    a, B, b, C, D, d = model.partition_ldspars(ψ, ldsdims, d_state, d_out, d_in)
+    η₁ = model.arr2sc(η_h)
+    ornn.a = η₁*a
+    ornn.B = η₁*T(0.1)*B
+    ornn.b = η₁*T(0.1)*b
+    ornn.C, ornn.D, ornn.d = C, D, d;
+    ornn
+end
+
+function make_rnn_psi(ornn::Union{ORNN_g{T,F,Q}, ORNN_ng{T,F,Q}}, ψ, η_h=T(0.1)) where {T, F, Q}
+    make_rnn_psi!(copy(ornn), ψ, η_h)
+end
 
 #==============================================================================
     ⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅ MTLDS definition ⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅
@@ -584,7 +653,7 @@ Flux.gpu(x::MTLDS) = mapleaves(gpu, x)
 
 arr2sc(x) = (@argcheck length(x) == 1; x[1])
 
-function zero_state!(s::Union{model.MyLDS_g, model.MyLDS_ng, model.MTLDS_g, model.MTLDS_ng})
+function zero_state!(s::Union{MyLDS_g, MyLDS_ng, MTLDS_g, MTLDS_ng})
     h = Tracker.data(s.h)
     h .= zeros(eltype(s), size(s, 1))
     return nothing
@@ -592,7 +661,7 @@ end
 
 
 function change_relative_lr!(m::MTLDS_ng{T,F}, η_rel::T) where {T,F}
-    chainpdim = model._partition_ldspars_dims(size(m)...)[3]
+    chainpdim = _partition_ldspars_dims(size(m)...)[3]
     new_η, old_η = η_rel, m.η_h
     final_layer = m.nn.layers[end];
     if final_layer isa Flux.Dense
