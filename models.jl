@@ -500,7 +500,8 @@ end
 
 function eval_ornn(m::Union{ORNN_g, ORNN_ng}, U)
     rnn = build_rnn(m)
-    x̂ = Tracker.collect(reduce(hcat, [rnn(U[:,i]) for i in 1:size(U,2)]))
+    x̂ = reduce(hcat, [rnn(U[:,i]) for i in 1:size(U,2)])
+    (has_grad(m)) && (x̂ = Tracker.collect(x̂))
     return m.C*x̂ + m.D*U .+ m.d
 end
 

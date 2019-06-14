@@ -207,9 +207,17 @@ function Base.length(iter::DataIterator)
         end |> sum
 end
 
-function shuffle(di::mocaputil.DataIterator)
+function shuffle(di::DataIterator)
     newdata = shuffle([Dict(:Y=>cY, :U=>cU) for (cY, cU, h0) in di])
     mocaputil.DataIterator(newdata, di.batch_size, 1, di.start)
+end
+
+
+function indexed_shuffle(di::DataIterator)
+    order = sortperm(1:length(di))
+    dataArray = [Dict(:Y=>cY, :U=>cU) for (cY, cU, h0) in di]
+    newdata = [dataArray[i] for i in order]
+    order, mocaputil.DataIterator(newdata, di.batch_size, 1, di.start)
 end
 
 #### TESTING
