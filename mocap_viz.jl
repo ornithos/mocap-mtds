@@ -173,4 +173,21 @@ function create_animation(data::Vector, names::Union{String, Array{String}}="dat
     return vis
 end
 
+
+function plot_2d_skeleton(joints::AbstractMatrix)
+    @argcheck size(joints) == (21, 3)
+    parents=[1,2,3,4,1,6,7,8,1,10,11,12,12,14,15,16,12,18,19,20]
+    scatter(joints[:,1], joints[:,2]);
+    [plot([[joints[p,j], joints[e+1,j]] for j in 1:2]..., c="k") for (e,p) in enumerate(parents)]
+    [text(joints[i,1]+0.2, joints[i,2]-0.7, i) for i in 1:21]
+    gca().set_aspect("equal")
+    gca().axis("off");
+end
+
+function plot_2d_skeleton(root_y::AbstractFloat, joints::AbstractMatrix)
+    @argcheck size(joints) == (20, 3)
+    joints = vcat([0 root_y 0], joints);
+    plot_2d_skeleton(joints)
+end
+
 end
