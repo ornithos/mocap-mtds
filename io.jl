@@ -307,7 +307,7 @@ end
 
 """
     construct_inputs(raw [; direction=:relative, joint_pos=true,
-    fps=60, include_ftcontact=false, include_ftmid=false])
+    fps=60, include_ftcontact=false, include_ftmid=false, speed=true])
 
 Construct the input matrix for the mocap models. The input `raw` is the raw
 output from the `process_file` function. The function outputs the following
@@ -326,8 +326,8 @@ The following columns are contained in the matrix:
 * (12): ± 60 frame trajectory z-cood at step 10 intervals
 * (12): ± 60 frame trajectory body angle sin(θ) to forward
 * (12): ± 60 frame trajectory body angle cos(θ) to forward
-* (12): ± 60 frame trajectory magnitude of velocity
 * (12): ± 60 frame trajectory path angle to root. (Derived from x/z above.)
+* (12): ± 60 frame trajectory magnitude of velocity (optional)
 * (61): joint positions in Lagrangian frame (optional)
 * (4) : foot contacts (calc. by threshold), [L ball, L toe, R ball, R toe] (optional).
 * (4) : foot contacts midpoints (see above; midpoint of each interval as binary indicator)
@@ -358,14 +358,14 @@ using `include_ftmid=true`. (I still want to eschew deriving a phase signal: eve
 in the locomotion data, this is often confused, and is anyway derived from foot contacts.)
 """
 function construct_inputs(raw; direction=:relative, joint_pos=true,
-        fps::Int=60, include_ftcontact=false, include_ftmid=false)
+        fps::Int=60, include_ftcontact=false, include_ftmid=false, speed=true)
     X = reconstruct_raw(raw)
     construct_inputs(X, raw; direction=direction, joint_pos=joint_pos, fps=fps,
-        include_ftcontact=include_ftcontact, include_ftmid=include_ftmid)
+        include_ftcontact=include_ftcontact, include_ftmid=include_ftmid, speed=speed)
 end
 
 function construct_inputs(X, raw; direction=:relative, joint_pos=true,
-        fps::Int=60, include_ftcontact=false, include_ftmid=false)
+        fps::Int=60, include_ftcontact=false, include_ftmid=false, speed=true)
     @argcheck direction in [:relative, :absolute]
     @argcheck fps in [30,60,120]
     @argcheck size(X)[2:3] == (21, 3)
@@ -380,24 +380,25 @@ function construct_inputs(X, raw; direction=:relative, joint_pos=true,
     T = eltype(raw)
 
     # traj_pos (12x2), abs./rel. direction (12x2), abs. velocity (12), joint positions (63)
+    spnum = speed ? 12 : 0
     jpnum = joint_pos ? 61 : 0
     ftnum = include_ftcontact ? 4 : 0
     ftmnum = include_ftmid ? 4 : 0
-    Xs = Matrix{T}(undef, N, 48 + 24 + jpnum + ftnum + ftmnum)
+    Xs = Matrix{T}(undef, N, 48 + 12 + spnum + jpnum + ftnum + ftmnum)
 
     # add rel. pos from raw
     if joint_pos
-        Xs[:, 72+1] = raw[use_ixs,9]          # x,z value of root are always zero
-        Xs[:, 74:74+59] = raw[use_ixs,11:70]
+        Xs[:, 60+spnum+1] = raw[use_ixs,9]          # x,z value of root are always zero
+        Xs[:, (60+spnum+2):(60+spnum+2+59)] = raw[use_ixs,11:70]
     end
 
     if include_ftcontact
-        Xs[:, (72 + joint_pos*61) .+ (1:4)] = raw[use_ixs, 4:7]
+        Xs[:, (60+spnum + jpnum) .+ (1:4)] = raw[use_ixs, 4:7]
     end
 
     if include_ftmid
         extra = zeros(T, N, 4)
-        Xix2 = 72 + joint_pos*61 + include_ftcontact*4
+        Xix2 = 60 + spnum + jpnum + include_ftcontact*4
         for j in 1:4
             Xs[:, Xix2 + j] = mid_footcontact(raw[use_ixs, 4+j-1])
         end
@@ -456,10 +457,10 @@ function construct_inputs(X, raw; direction=:relative, joint_pos=true,
             Xs[r, 25:48] = vec(cforward)
         end
 
-        Xs[r, 49:60] = sqrt.(sum(x->x^2, cvel, dims=2)[:])
+        speed && (Xs[r, 61:72] = sqrt.(sum(x->x^2, cvel, dims=2)[:]))
     end
 
-    Xs[:, 61:72] = atan.(Xs[:, 1:12], Xs[:, 13:24])
+    Xs[:, 49:60] = atan.(Xs[:, 1:12], Xs[:, 13:24])
 
     return Xs
 end

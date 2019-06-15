@@ -478,7 +478,7 @@ function make_nograd(s::ORNN_g{T,F,C}) where {T,F,C}
     ORNN_ng{T,F,typeof(inpnn)}(f(s.a), f(s.B), f(s.b), f(s.h), f(s.C), f(s.D), f(s.d), s.σ, inpnn)
 end
 
-pars(s::ORNN_g) = Flux.params(s.a, s.B, s.b, s.C, s.D, s.d, Flux.params(inpnn)...)
+pars(s::ORNN_g) = Flux.params(s.a, s.B, s.b, s.C, s.D, s.d, Flux.params(s.inpnn)...)
 pars_no_inpnn(s::ORNN_g)  = Flux.params(s.a, s.B, s.b, s.C, s.D, s.d)
 
 function build_rnn!(rnn::Flux.Recur, m::Union{ORNN_g, ORNN_ng})
