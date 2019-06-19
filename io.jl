@@ -284,7 +284,9 @@ function _joints_fk(joints::Matrix{T}, root_x::Vector{T}, root_z::Vector{T},
         root_r::Vector{T}) where T <: Number
 
     n = size(joints, 1)
-    joints = _rowmaj_reshape_3d(joints, n, 21, 3)
+    njoints = size(joints, 2) ÷ 3
+    @assert (njoints * 3 == size(joints, 2)) "number of columns must be div. 3"
+    joints = _rowmaj_reshape_3d(joints, n, njoints, 3)
 #     joints = reshape(joints, n, 3, 21)
 #     joints = permutedims(joints, [1,3,2])
     rotation = Quaternion(1.0)
