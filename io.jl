@@ -372,6 +372,14 @@ function construct_inputs(X, raw; direction=:relative, joint_pos=true,
     @argcheck size(raw, 2) == 196
     @argcheck size(X, 1) == size(raw, 1)
 
+    if speed isa Symbol
+        @argcheck speed == :footcontacts
+        @assert include_ftcontact "can't multiply foot contacts by speed: include_ftcontact=false"
+        speed = false
+        include_ftcontact = 2
+    end
+    include_ftcontact = Int(include_ftcontact)
+
     # proc = (N-2)   *  [ rvel (1), xvel (1), zvel (1), feet (4),  pos (63),  vel (63),  rot (63) ]
     ϝ = fps/60
     t₀, t₁, Δt = Int(70 * ϝ),  size(X, 1) - Int(60 * ϝ), Int(10 * ϝ)
@@ -382,7 +390,7 @@ function construct_inputs(X, raw; direction=:relative, joint_pos=true,
     # traj_pos (12x2), abs./rel. direction (12x2), abs. velocity (12), joint positions (63)
     spnum = speed ? 12 : 0
     jpnum = joint_pos ? 61 : 0
-    ftnum = include_ftcontact ? 4 : 0
+    ftnum = include_ftcontact  > 0 ? 4 : 0
     ftmnum = include_ftmid ? 4 : 0
     Xs = Matrix{T}(undef, N, 48 + 12 + spnum + jpnum + ftnum + ftmnum)
 
@@ -392,13 +400,13 @@ function construct_inputs(X, raw; direction=:relative, joint_pos=true,
         Xs[:, (60+spnum+2):(60+spnum+2+59)] = raw[use_ixs,11:70]
     end
 
-    if include_ftcontact
+    if include_ftcontact > 0
         Xs[:, (60+spnum + jpnum) .+ (1:4)] = raw[use_ixs, 4:7]
     end
 
     if include_ftmid
         extra = zeros(T, N, 4)
-        Xix2 = 60 + spnum + jpnum + include_ftcontact*4
+        Xix2 = 60 + spnum + jpnum + ftnum
         for j in 1:4
             Xs[:, Xix2 + j] = mid_footcontact(raw[use_ixs, 4+j-1])
         end
@@ -457,7 +465,12 @@ function construct_inputs(X, raw; direction=:relative, joint_pos=true,
             Xs[r, 25:48] = vec(cforward)
         end
 
-        speed && (Xs[r, 61:72] = sqrt.(sum(x->x^2, cvel, dims=2)[:]))
+        if speed
+            Xs[r, 61:72] = sqrt.(sum(x->x^2, cvel, dims=2)[:])
+        elseif include_ftcontact == 2
+            Xs[r, (60+spnum + jpnum) .+ (1:4)] *= sqrt.(sum(x->x^2, cvel, dims=2)[7])
+        end
+
     end
 
     Xs[:, 49:60] = atan.(Xs[:, 1:12], Xs[:, 13:24])
