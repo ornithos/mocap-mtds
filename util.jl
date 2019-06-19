@@ -175,6 +175,7 @@ struct DataIterator
     DataIterator(d, b_sz, m_sz, start) = begin; @assert m_sz < b_sz; new(d, b_sz, m_sz, start); end
 end
 DataIterator(data, batch_size; min_size=1, start=0) = DataIterator(data, batch_size, min_size, start)
+Base.copy(di::DataIterator) = DataIterator(deepcopy(di.data), copy(di.batch_size), copy(di.min_size), copy(di.start))
 
 function Base.iterate(iter::DataIterator, state=(1, iter.start))
     element, ix = state
@@ -214,7 +215,7 @@ end
 
 
 function indexed_shuffle(di::DataIterator)
-    order = sortperm(1:length(di))
+    order = shuffle(1:length(di))
     dataArray = [Dict(:Y=>cY, :U=>cU) for (cY, cU, h0) in di]
     newdata = [dataArray[i] for i in order]
     order, mocaputil.DataIterator(newdata, di.batch_size, 1, di.start)

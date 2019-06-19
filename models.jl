@@ -468,13 +468,13 @@ Base.copy(s::ORNN) = Flux.mapleaves(deepcopy, s)
 
 function make_grad(s::ORNN_ng{T,F,C}) where {T,F,C}
     f = Flux.param
-    inpnn = mapleaves(f, s.inpnn)
+    inpnn = length(s.inpnn) > 0 ? s.inpnn : mapleaves(f, s.inpnn)
     ORNN_g{T,F,typeof(inpnn)}(f(s.a), f(s.B), f(s.b), f(s.h), f(s.C), f(s.D), f(s.d), s.σ, inpnn)
 end
 
 function make_nograd(s::ORNN_g{T,F,C}) where {T,F,C}
     f = Tracker.data
-    inpnn = mapleaves(f, s.inpnn)
+    inpnn = length(s.inpnn) > 0 ? s.inpnn : mapleaves(f, s.inpnn)
     ORNN_ng{T,F,typeof(inpnn)}(f(s.a), f(s.B), f(s.b), f(s.h), f(s.C), f(s.D), f(s.d), s.σ, inpnn)
 end
 
@@ -634,7 +634,7 @@ function _make_lds_psi(s::Union{MTLDS_g{T,F}, MTLDS_ng{T,F}},
     a, B, b, C, D, d = partition_ldspars(ψ, ldsdims, d_state, d_out, d_in)
     state = deepcopy(s.h)
     ldstype = has_grad(s) ? MyLDS_g{T} : MyLDS_ng{T}
-    η₁ = arr2sc(s.η_h)
+    η₁ = arr2sc(η_h)
     return ldstype(η₁*a + s.a, η₁*T(0.1)*B + s.B, η₁*T(0.1)*b + s.b, C + s.C, D + s.D, d + s.d, state)
 end
 
