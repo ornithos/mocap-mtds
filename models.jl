@@ -468,13 +468,13 @@ Base.copy(s::ORNN) = Flux.mapleaves(deepcopy, s)
 
 function make_grad(s::ORNN_ng{T,F,C}) where {T,F,C}
     f = Flux.param
-    inpnn = length(s.inpnn) > 0 ? s.inpnn : mapleaves(f, s.inpnn)
+    inpnn = length(s.inpnn) > 0 ? mapleaves(f, s.inpnn) : s.inpnn
     ORNN_g{T,F,typeof(inpnn)}(f(s.a), f(s.B), f(s.b), f(s.h), f(s.C), f(s.D), f(s.d), s.σ, inpnn)
 end
 
 function make_nograd(s::ORNN_g{T,F,C}) where {T,F,C}
     f = Tracker.data
-    inpnn = length(s.inpnn) > 0 ? s.inpnn : mapleaves(f, s.inpnn)
+    inpnn = length(s.inpnn) > 0 ? mapleaves(f, s.inpnn) : s.inpnn
     ORNN_ng{T,F,typeof(inpnn)}(f(s.a), f(s.B), f(s.b), f(s.h), f(s.C), f(s.D), f(s.d), s.σ, inpnn)
 end
 
