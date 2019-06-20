@@ -307,6 +307,22 @@ function _joints_fk(joints::Matrix{T}, root_x::Vector{T}, root_z::Vector{T},
 end
 
 
+function _traj_fk(start::Vector{T}, root_x::Vector{T}, root_z::Vector{T}, root_r::Vector{T}) where T <: Number
+    rotation = Quaternion(1.0)
+    translation = zeros(3)
+    n = length(root_x)
+    traj = repeat(start', 3, n+1);
+    for i = 1:n
+        traj[:, i+1] = _qimag(_apply_rotation(quat(traj[:, i+1]), rotation))
+        traj[1, i+1] += translation[1]
+        traj[3, i+1] += translation[3]
+        rotation = _quaterion_angle_axis_w_y(-root_r[i]) * rotation
+        translation = translation + _qimag(_apply_rotation(quat(0., root_x[i], 0, root_z[i]), rotation))
+    end
+
+    return traj[1,:], traj[3,:]
+end
+
 """
     construct_inputs(raw [; direction=:relative, joint_pos=true,
     fps=60, include_ftcontact=false, include_ftmid=false, speed=true])
@@ -324,12 +340,12 @@ fps of 60. If a different fps is extracted (30 or 120), specify `fps=30` or `fps
 
 The following columns are contained in the matrix:
 
-* (12): ± 60 frame trajectory x-cood at step 10 intervals
-* (12): ± 60 frame trajectory z-cood at step 10 intervals
-* (12): ± 60 frame trajectory body angle sin(θ) to forward
-* (12): ± 60 frame trajectory body angle cos(θ) to forward
-* (12): ± 60 frame trajectory path angle to root. (Derived from x/z above.)
-* (12): ± 60 frame trajectory magnitude of velocity (optional)
+* (6):  +60 frame trajectory x-cood at step 10 intervals
+* (6):  +60 frame trajectory z-cood at step 10 intervals
+* (6):  +60 frame trajectory body angle sin(θ) to forward
+* (6):  +60 frame trajectory body angle cos(θ) to forward
+* (6):  +60 frame trajectory path angle to root. (Derived from x/z above.)
+* (6):  +60 frame trajectory magnitude of velocity (optional)
 * (61): joint positions in Lagrangian frame (optional)
 * (4) : foot contacts (calc. by threshold), [L ball, L toe, R ball, R toe] (optional).
 * (4) : foot contacts midpoints (see above; midpoint of each interval as binary indicator)
@@ -384,53 +400,44 @@ function construct_inputs(X, raw; direction=:relative, joint_pos=true,
 
     # proc = (N-2)   *  [ rvel (1), xvel (1), zvel (1), feet (4),  pos (63),  vel (63),  rot (63) ]
     ϝ = fps/60
-    t₀, t₁, Δt = Int(70 * ϝ),  size(X, 1) - Int(60 * ϝ), Int(10 * ϝ)
+    t₀, t₁, Δt = Int(60 * ϝ),  size(X, 1) - Int(70 * ϝ), Int(10 * ϝ)
     use_ixs = range(t₀, stop=t₁)
     N = length(use_ixs)
     T = eltype(raw)
 
     # traj_pos (12x2), abs./rel. direction (12x2), abs. velocity (12), joint positions (63)
-    spnum = speed ? 12 : 0
+    spnum = speed ? 6 : 0
     jpnum = joint_pos ? 61 : 0
     ftnum = include_ftcontact  > 0 ? 4 : 0
     ftmnum = include_ftmid ? 4 : 0
-    Xs = Matrix{T}(undef, N, 48 + 12 + spnum + jpnum + ftnum + ftmnum)
+    Xs = Matrix{T}(undef, N, 30 + spnum + jpnum + ftnum + ftmnum)
 
     # add rel. pos from raw
     if joint_pos
-        Xs[:, 60+spnum+1] = raw[use_ixs,9]          # x,z value of root are always zero
-        Xs[:, (60+spnum+2):(60+spnum+2+59)] = raw[use_ixs,11:70]
+        Xs[:, 30+spnum+1] = raw[use_ixs,9]          # x,z value of root are always zero
+        Xs[:, (30+spnum+2):(30+spnum+2+59)] = raw[use_ixs,11:70]
     end
 
     if include_ftcontact > 0
-        Xs[:, (60+spnum + jpnum) .+ (1:4)] = raw[use_ixs, 4:7]
+        Xs[:, (30+spnum + jpnum) .+ (1:4)] = raw[use_ixs, 4:7]
     end
 
     if include_ftmid
         extra = zeros(T, N, 4)
-        Xix2 = 60 + spnum + jpnum + ftnum
+        Xix2 = 30 + spnum + jpnum + ftnum
         for j in 1:4
             Xs[:, Xix2 + j] = mid_footcontact(raw[use_ixs, 4+j-1])
         end
     end
 
-    # Extract -60:10:59 (or -30:5:29 etc.) trajectory on a rolling basis
-    # ---------------------------------------
-    for i in 1:12
-        Xs[:,i]    = X[(Δt:N+Δt-1) .+ (i-1)*Δt, 1, 1]
-        Xs[:,i+12] = X[(Δt:N+Δt-1) .+ (i-1)*Δt, 1, 3]
+    # Calculate forward trajectory: perform FK on each trajectory segment
+    # Probably faster ways to do this, but no need ∵ julia!
+    for (i, rix) in enumerate(use_ixs)
+        rs = rix:(rix+(Δt*6))
+        t_x, t_z = _traj_fk(zeros(T, 3), raw[rs, 2], raw[rs, 3], raw[rs, 1])
+        Xs[i, 1:6] = t_x[Δt:Δt:6*Δt]
+        Xs[i, 7:12] = t_z[Δt:Δt:6*Δt]
     end
-    Xs[:,1:12] .-= Xs[:,7]
-    Xs[:,13:24] .-= Xs[:,19]
-
-    # convert Euler trajectory to Lagrangian frame
-    prev_dir = hcat(-Xs[:,6], -Xs[:,18])   # ∵ [7] == 0, hence diff is -[6]
-    cθ, sθ   = _trigvecs(prev_dir, hcat(zeros(T, N, 1), ones(T, N, 1))) # calc angle to z-axis (2nd cood)
-    cθ, sθ   = cθ, sθ  # reverse sign of θ (note cos is unchanged ∵ even fn)
-    euler_traj  = Xs[:,1:24]  # implicit copy
-    Xs[:,1:12]  = euler_traj[:,1:12] .* cθ - euler_traj[:,13:24] .* sθ
-    Xs[:,13:24] = euler_traj[:,1:12] .* sθ + euler_traj[:,13:24] .* cθ
-
 
     # Calculate body direction and velocity
     # ---------------------------------------
@@ -455,27 +462,27 @@ function construct_inputs(X, raw; direction=:relative, joint_pos=true,
     # display("Rel angle2     ")
     # display(size(rel_angle))
     for (r, ix) in enumerate(use_ixs)
-        v_ixs = (ix+Int(-70 * ϝ)+1):Δt:(ix+Int(40 * ϝ)+1) # note vel is +10--> due to +5/-5 differencing
+        v_ixs = (ix+1):Δt:(ix+Int(50 * ϝ)+1) # note vel is +10--> due to +5/-5 differencing
         cvel = view(traj_vel_xz, v_ixs, :)
 
         if direction == :relative
             cangle = view(rel_angle, v_ixs,:)
-            Xs[r, 25:48] = vec(cangle)
+            Xs[r, 13:24] = vec(cangle)
         else
-            a_ixs = (ix+Int(-60 * ϝ)):Δt:(ix+Int(50 * ϝ))
+            a_ixs = (ix+10):Δt:(ix+Int(60 * ϝ))
             cforward = view(forward, a_ixs, :)
-            Xs[r, 25:48] = vec(cforward)
+            Xs[r, 13:24] = vec(cforward)
         end
 
         if speed
-            Xs[r, 61:72] = sqrt.(sum(x->x^2, cvel, dims=2)[:])
+            Xs[r, 31:36] = sqrt.(sum(x->x^2, cvel, dims=2)[:])
         elseif include_ftcontact == 2
-            Xs[r, (60+spnum + jpnum) .+ (1:4)] *= sqrt.(sum(x->x^2, cvel, dims=2)[7])
+            Xs[r, (30+spnum + jpnum) .+ (1:4)] *= sqrt.(sum(x->x^2, cvel, dims=2)[1])
         end
 
     end
 
-    Xs[:, 49:60] = atan.(Xs[:, 1:12], Xs[:, 13:24])
+    Xs[:, 25:30] = atan.(Xs[:, 1:6], Xs[:, 7:12])
 
     return Xs
 end
@@ -530,7 +537,7 @@ function construct_outputs(raw; include_ftcontact=true, fps::Int=60)
     @argcheck size(raw, 2) == 196
     @argcheck fps in [30,60,120]
     ϝ = fps/60
-    t₀, t₁, Δt = Int(70 * ϝ),  size(raw, 1) - Int(60 * ϝ), Int(10 * ϝ)
+    t₀, t₁, Δt = Int(60 * ϝ),  size(raw, 1) - Int(70 * ϝ), Int(10 * ϝ)
 
     ixs = range(t₀, stop=t₁)
     if !include_ftcontact
