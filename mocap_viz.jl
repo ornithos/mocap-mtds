@@ -19,6 +19,13 @@ darkencol(x::RGB) = whitebalance(x, colorant"white", colorant"grey55")
 darkencol(x::RGBA) = let u=convert(RGB, x); y=darkencol(u); y=RGBA(y.r, y.g, y.b, x.alpha); y; end
 darkencol(x::GenericMaterial) = GenericMaterial(_type=x._type, color=darkencol(x.color))   # includes MeshPhongMaterial
 
+# note that the y-axis (vertical) in three.js is the *last*/*3rd* dimension.
+project_ground!(x::AbstractVector) = begin; (length(x)==0 && return); @assert length(x) == 3; x[3] = 0; end;
+project_ground(x::AbstractVector) = begin; x = copy(x); project_ground!(x); x; end
+project_ground!(X::AbstractMatrix) = begin; (length(X)==0 && return); @assert size(X,2) == 3; X[:,3] .= 0; end;
+project_ground(X::AbstractMatrix) = begin; X = copy(X); project_ground!(X); X; end
+
+
 # initialise lines and dots
 mutable struct LineCollection{T, R}
     data::Array{T}
@@ -136,13 +143,13 @@ function create_animation(data::Vector, names::Union{String, Array{String}}="dat
     (linemesh isa AbstractMaterial) && (linemesh = repeat([linemesh], n))
     ispath && (path isa AbstractMatrix) && (path = [path])
     npaths = ispath ? length(path) : 0
-    ispath && (pathmesh = map(darkencol, linemesh));
-
+    (npaths >= 1) && (pathmesh = map(darkencol, linemesh));
+    (npaths == 1) && (pathmesh = [blackmesh]);
     # assertions
     @argcheck length(data) == length(names)
     @assert (all([ndims(d) for d in data] .== 3) && all([size(d,3) for d in data] .==3)) "Need NxJx3 matrices."
     @argcheck camera in [:front, :back, :static]
-    ispath && @argcheck size(path[1]) == (Ts[1], 24)
+    ispath && @argcheck size(path[1]) == (Ts[1], 12)
     # @assert all(ls .<= length(parents)-1) "more joints given (dim 1) than are assigned parents."
     # any(ls .> length(parents)) && @warn format("({:d}/{:d}) datasets have fewer joints than specified in parents.",
     #     sum(ls .> length(parents)), n)
@@ -160,7 +167,7 @@ function create_animation(data::Vector, names::Union{String, Array{String}}="dat
     # Initialise objects for each dataset
     objs = map(1:n) do i
         if i <= npaths
-            obj_path = LineCollection(repeat([Cylinder(zero(Point{3, Float64}), Point{3}([1.,0,0]), 0.03)], 11), map(pathstr,  1:11), repeat([pathmesh[i]], 11))
+            obj_path = LineCollection(repeat([Cylinder(zero(Point{3, Float64}), Point{3}([1.,0,0]), 0.02)], 10), map(pathstr,  1:10), repeat([pathmesh[i]], 10))
             setobj_collection!(vis[names[i]], obj_path)
         else
             obj_path = nothing
@@ -193,8 +200,11 @@ function create_animation(data::Vector, names::Union{String, Array{String}}="dat
                     settransform_collection!(frame[names[i]], lines, joints; anim=true)  # note order: lines at back, joints at front
 
                     if i <= npaths
-                        path_matrix = hcat(reshape(path[i][tt, :], 12, 2), zeros(12))*scale
-                        update_pos!(pathlines, path_matrix[1:11,:], path_matrix[2:12,:])
+                        trail = randn(5,3)*0.001   # base case: all segments have positive length
+                        trail_ixs = max(tt-41, 1):10:(tt-1)
+                        trail[(6-length(trail_ixs)):5, :] = project_ground(data[i][trail_ixs, 1, reord])
+                        path_matrix = vcat(trail, hcat(reshape(path[i][tt, :], 6, 2), zeros(6)))*scale
+                        update_pos!(pathlines, path_matrix[1:10,:], path_matrix[2:11,:])
                         settransform_collection!(frame[names[i]], pathlines; anim=true)
                     end
                 end
