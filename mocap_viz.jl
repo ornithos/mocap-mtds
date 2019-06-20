@@ -6,14 +6,18 @@ using CoordinateTransformations: LinearMap, AffineMap, Translation, rotation_bet
 using GeometryTypes: Cylinder, HyperSphere, Point
 using LinearAlgebra: norm
 using DSP   # conv
-using Colors: RGBA, RGB
+using Colors   # RGB, RGBA, colorant_str
 using Formatting, ArgCheck
 
-
-const pathmesh = MeshPhongMaterial(color=RGBA(0.1, 0.1, 0.1, 0.4))
+import MeshCat: GenericMaterial
+const blackmesh = MeshPhongMaterial(color=RGBA(0.1, 0.1, 0.1, 0.4))
 const greymesh = MeshPhongMaterial(color=RGBA(0.3, 0.3, 0.3, 0.7))
 const yellowmesh = MeshPhongMaterial(color=RGBA(204/255, 204/255, 0., 0.7))
 const redmesh = MeshPhongMaterial(color=RGBA(224/255, 131/255, 94/255, 0.7))
+
+darkencol(x::RGB) = whitebalance(x, colorant"white", colorant"grey55")
+darkencol(x::RGBA) = let u=convert(RGB, x); y=darkencol(u); y=RGBA(y.r, y.g, y.b, x.alpha); y; end
+darkencol(x::GenericMaterial) = GenericMaterial(_type=x._type, color=darkencol(x.color))   # includes MeshPhongMaterial
 
 # initialise lines and dots
 mutable struct LineCollection{T, R}
@@ -117,22 +121,28 @@ function create_animation(data::Vector, names::Union{String, Array{String}}="dat
     vis=nothing, parents=[1,2,3,4,1,6,7,8,1,10,11,12,12,14,15,16,12,18,19,20],
     jointmesh::Union{AbstractMaterial, Vector{T} where T <: AbstractMaterial}=greymesh,
     linemesh::Union{AbstractMaterial, Vector{T} where T <: AbstractMaterial}=yellowmesh, scale=0.1,
-    camera::Symbol=:front, path::Union{Nothing, Matrix{T} where T <: Real}=nothing)
+    camera::Symbol=:front, path::Union{Nothing, AbstractMatrix{T} where T <: Real, Vector}=nothing)
 
+    # dimensions
     Ts = [size(d,1) for d in data]
     ls = [size(d,2) for d in data]
     n  = length(ls)
     maxT = maximum(Ts)
     ispath = !(path === nothing)
 
+    # convenience expansions if args are singular
     (names isa String) && (names = [names * string(i) for i in 1:n])
-    (jointmesh isa AbstractMaterial) && (jointmesh = [jointmesh for i in 1:n])
-    (linemesh isa AbstractMaterial) && (linemesh = [linemesh for i in 1:n])
+    (jointmesh isa AbstractMaterial) && (jointmesh = repeat([jointmesh], n))
+    (linemesh isa AbstractMaterial) && (linemesh = repeat([linemesh], n))
+    ispath && (path isa AbstractMatrix) && (path = [path])
+    npaths = ispath ? length(path) : 0
+    ispath && (pathmesh = map(darkencol, linemesh));
 
+    # assertions
     @argcheck length(data) == length(names)
     @assert (all([ndims(d) for d in data] .== 3) && all([size(d,3) for d in data] .==3)) "Need NxJx3 matrices."
     @argcheck camera in [:front, :back, :static]
-    ispath && @argcheck size(path) == (Ts[1], 24)
+    ispath && @argcheck size(path[1]) == (Ts[1], 24)
     # @assert all(ls .<= length(parents)-1) "more joints given (dim 1) than are assigned parents."
     # any(ls .> length(parents)) && @warn format("({:d}/{:d}) datasets have fewer joints than specified in parents.",
     #     sum(ls .> length(parents)), n)
@@ -149,15 +159,19 @@ function create_animation(data::Vector, names::Union{String, Array{String}}="dat
 
     # Initialise objects for each dataset
     objs = map(1:n) do i
+        if i <= npaths
+            obj_path = LineCollection(repeat([Cylinder(zero(Point{3, Float64}), Point{3}([1.,0,0]), 0.03)], 11), map(pathstr,  1:11), repeat([pathmesh[i]], 11))
+            setobj_collection!(vis[names[i]], obj_path)
+        else
+            obj_path = nothing
+        end
+
         nj, nl = ls[i], ls[i]-1
         obj_lc = LineCollection(repeat([Cylinder(zero(Point{3, Float64}), Point{3}([1.,0,0]), 0.03)], nl), map(linestr, 1:nl), repeat([linemesh[i]], nl))
         obj_jc = JointCollection(repeat([HyperSphere(Point{3}(0.), 0.04)], nj), map(dotstr, 1:nj), repeat([jointmesh[i]], nj))
         setobj_collection!(vis[names[i]], obj_lc, obj_jc)  # note order: lines at back, joints at front
-        (obj_lc, obj_jc)
+        (obj_lc, obj_jc, obj_path)
     end
-    # Initialise path in frame if reqd
-    obj_path = LineCollection(repeat([Cylinder(zero(Point{3, Float64}), Point{3}([1.,0,0]), 0.03)], 11), map(pathstr,  1:11), repeat([pathmesh], 11))
-    ispath && setobj_collection!(vis["path"], obj_path)
 
     #=========== BEGIN ANIMATION CONSTRUCTION ===============================#
     anim = Animation()
@@ -173,20 +187,21 @@ function create_animation(data::Vector, names::Union{String, Array{String}}="dat
         atframe(anim, vis, tt-1) do frame
             for i in 1:n
                 if Ts[i] >= tt
-                    lines, joints = objs[i]
+                    lines, joints, pathlines = objs[i]
                     update_pos!(lines, data[i][tt,:,reord]*scale, parents)   # Note that update_pos only updates the line/joint collection position.
                     update_pos!(joints, data[i][tt,:,reord]*scale);          # Once these objects are correct, `settransform_collection` pushes => animation.
                     settransform_collection!(frame[names[i]], lines, joints; anim=true)  # note order: lines at back, joints at front
+
+                    if i <= npaths
+                        path_matrix = hcat(reshape(path[i][tt, :], 12, 2), zeros(12))*scale
+                        update_pos!(pathlines, path_matrix[1:11,:], path_matrix[2:12,:])
+                        settransform_collection!(frame[names[i]], pathlines; anim=true)
+                    end
                 end
             end
             # one-per-frame updates
             if camera != :static
                 settransform!(frame["/Cameras/default"], Translation(pos[tt,1] + cc[1], pos[tt,2] + cc[2], 1))
-            end
-            if ispath && Ts[1] >= tt
-                path_matrix = hcat(reshape(path[tt, :], 12, 2), zeros(12))*scale
-                update_pos!(obj_path, path_matrix[1:11,:], path_matrix[2:12,:])
-                settransform_collection!(frame["path"], obj_path; anim=true)
             end
         end
     end
