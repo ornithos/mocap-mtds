@@ -14,6 +14,7 @@ const blackmesh = MeshPhongMaterial(color=RGBA(0.1, 0.1, 0.1, 0.4))
 const greymesh = MeshPhongMaterial(color=RGBA(0.3, 0.3, 0.3, 0.7))
 const yellowmesh = MeshPhongMaterial(color=RGBA(204/255, 204/255, 0., 0.7))
 const redmesh = MeshPhongMaterial(color=RGBA(224/255, 131/255, 94/255, 0.7))
+const greenmesh = MeshPhongMaterial(color=RGBA(131/255, 224/255, 94/255, 0.7))
 
 darkencol(x::RGB) = whitebalance(x, colorant"white", colorant"grey55")
 darkencol(x::RGBA) = let u=convert(RGB, x); y=darkencol(u); y=RGBA(y.r, y.g, y.b, x.alpha); y; end

@@ -116,5 +116,22 @@ function table(cur_matrix1::Array, cur_matrix2::Array; header_row=[], header_col
         title=title, header=header, dp=dp)
 end
 
+using TexTables
+"""
+    latex_table(x::Matrix, headers::Vector)
+
+example usage:
+
+    @fmt Real = "{:.2f}"
+    let joints = reshape(Ys[1][4,5:end], 3, 20)';
+    joints = vcat([0 Ys[1][4,4] 0], joints);
+    end |> x->round.(x, digits=2) |> x->latex_table(x, ["x","y","z"]) |> to_tex |> print
+    @fmt Real = "{:.3f}"
+"""
+function latex_table(x::AbstractMatrix, headers::AbstractVector{T}) where T <: Union{String, Real}
+    n,d = size(x)
+    reduce(hcat, [TableCol(string(headers[i]), collect(1:n), x[:,i]) for i in 1:d])
+end
+latex_table(x::AbstractMatrix) = latex_table(x, collect(1:size(x,2)))
 
 end
