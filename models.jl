@@ -481,6 +481,11 @@ end
 pars(s::ORNN_g) = Flux.params(s.a, s.B, s.b, s.C, s.D, s.d, Flux.params(s.inpnn)...)
 pars_no_inpnn(s::ORNN_g)  = Flux.params(s.a, s.B, s.b, s.C, s.D, s.d)
 
+function _new_rnn(m::Union{ORNN_g, ORNN_ng})
+    d_state, d_out, d_in = size(m)
+    RNN(d_in, d_state, m.σ)
+end
+
 function build_rnn!(rnn::Flux.Recur, m::Union{ORNN_g, ORNN_ng})
     rnn.cell.Wi = m.B
     rnn.cell.b = m.b
@@ -488,19 +493,32 @@ function build_rnn!(rnn::Flux.Recur, m::Union{ORNN_g, ORNN_ng})
     rnn
 end
 
-function build_rnn(m::ORNN_g)
-    d_state, d_out, d_in = size(m)
-    build_rnn!(RNN(d_in, d_state, m.σ), m)
+build_rnn(m::ORNN_g) = build_rnn!(_new_rnn(m), m)
+build_rnn(m::ORNN_ng) = build_rnn!(mapleaves(Tracker.data, _new_rnn(m)), m)
+
+# separate functions to retain state... because I'm scared I'll break existing code
+function build_rnn_wstate!(rnn::Flux.Recur, m::Union{ORNN_g, ORNN_ng})
+    build_rnn!(rnn, m)
+    rnn.state = m.h
+    rnn
 end
 
-function build_rnn(m::ORNN_ng)
-    d_state, d_out, d_in = size(m)
-    build_rnn!(mapleaves(Tracker.data, RNN(d_in, d_state, m.σ)), m)
-end
+build_rnn_wstate(m::ORNN_g) = build_rnn_wstate!(_new_rnn(m), m)
+build_rnn_wstate(m::ORNN_ng) = build_rnn_wstate!(mapleaves(Tracker.data, _new_rnn(m)), m)
+
 
 function eval_ornn(m::Union{ORNN_g, ORNN_ng}, U)
     rnn = build_rnn(m)
     x̂ = reduce(hcat, [rnn(U[:,i]) for i in 1:size(U,2)])
+    (has_grad(m)) && (x̂ = Tracker.collect(x̂))
+    return m.C*x̂ + m.D*U .+ m.d
+end
+
+function eval_ornn_wstate(m::Union{ORNN_g, ORNN_ng}, U)
+    rnn = build_rnn_wstate(m)
+    x̂ = reduce(hcat, [rnn(U[:,i]) for i in 1:size(U,2)])
+    m_state = Tracker.data(m.h)
+    m_state .= rnn.state
     (has_grad(m)) && (x̂ = Tracker.collect(x̂))
     return m.C*x̂ + m.D*U .+ m.d
 end

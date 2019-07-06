@@ -10,15 +10,21 @@ using Colors   # RGB, RGBA, colorant_str
 using Formatting, ArgCheck
 
 import MeshCat: GenericMaterial
+
+Base.convert(::Type{Tuple}, c::RGB) = (c.r, c.g, c.b)
+transparency(c::RGB, α) = RGBA(convert(Tuple, c)..., α)
+darkencol(x::RGB) = whitebalance(x, colorant"white", colorant"grey55")
+darkencol(x::RGBA) = let u=convert(RGB, x); y=darkencol(u); y=RGBA(y.r, y.g, y.b, x.alpha); y; end
+darkencol(x::GenericMaterial) = GenericMaterial(_type=x._type, color=darkencol(x.color))   # includes MeshPhongMaterial
+
 const blackmesh = MeshPhongMaterial(color=RGBA(0.1, 0.1, 0.1, 0.4))
 const greymesh = MeshPhongMaterial(color=RGBA(0.3, 0.3, 0.3, 0.7))
 const yellowmesh = MeshPhongMaterial(color=RGBA(204/255, 204/255, 0., 0.7))
 const redmesh = MeshPhongMaterial(color=RGBA(224/255, 131/255, 94/255, 0.7))
-const greenmesh = MeshPhongMaterial(color=RGBA(131/255, 224/255, 94/255, 0.7))
 
-darkencol(x::RGB) = whitebalance(x, colorant"white", colorant"grey55")
-darkencol(x::RGBA) = let u=convert(RGB, x); y=darkencol(u); y=RGBA(y.r, y.g, y.b, x.alpha); y; end
-darkencol(x::GenericMaterial) = GenericMaterial(_type=x._type, color=darkencol(x.color))   # includes MeshPhongMaterial
+const bluemesh = MeshPhongMaterial(color=transparency(colorant"#4C9DFF", 0.8));
+const greenmesh = MeshPhongMaterial(color=transparency(colorant"#4CE54C", 0.8));
+const deepredmesh = MeshPhongMaterial(color=transparency(colorant"#E56666", 0.8));
 
 # note that the y-axis (vertical) in three.js is the *last*/*3rd* dimension.
 project_ground!(x::AbstractVector) = begin; (length(x)==0 && return); @assert length(x) == 3; x[3] = 0; end;
