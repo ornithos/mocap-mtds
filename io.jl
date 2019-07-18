@@ -3,7 +3,8 @@ module mocapio
 using LinearAlgebra, Statistics, Random
 using Quaternions    # For manipulating 3D Geometry
 using ProgressMeter, Formatting, ArgCheck # small utils libraries
-
+using HMMBase        # for smoothing foot contacts
+using Distributions: DiscreteNonParametric   # for smoothing foot contacts, like a Categorical distn.
 
 # Read a string from STDIN. The trailing newline is stripped. https://stackoverflow.com/a/23342933
 function input(prompt::String="")::String
@@ -311,7 +312,7 @@ function _traj_fk(start::Vector{T}, root_x::Vector{T}, root_z::Vector{T}, root_r
     rotation = Quaternion(1.0)
     translation = zeros(3)
     n = length(root_x)
-    traj = repeat(start', 3, n+1);
+    traj = repeat(start, 1, n+1);
     for i = 1:n
         traj[:, i+1] = _qimag(_apply_rotation(quat(traj[:, i+1]), rotation))
         traj[1, i+1] += translation[1]
@@ -325,37 +326,50 @@ end
 
 """
     construct_inputs(raw [; direction=:relative, joint_pos=true,
-    fps=60, include_ftcontact=false, include_ftmid=false, speed=true])
+            fps::Int=60, smooth_trajectory=false, turn360mask=false,
+            root_angle=true, speed=true, lead_ft=false, include_ftcontact=false,
+            include_ftmid=false, smooth_ix=0)
 
 Construct the input matrix for the mocap models. The input `raw` is the raw
 output from the `process_file` function. The function outputs the following
 matrix, which contains only the range of frames: [start+69, end-60] (i.e.)
-excluding approx. the first and last second. This is in order to construct
-trajectories that extend ± 60 frames of the current position. (The additional is
-due to needing a bit extra to calculate velocity, plus some historical baggage.)
-Note also that the trajectory is centered at every frame at the current position
-and hence `(trajectory_x(7), trajectory_z(7)) == (0.0, 0.0)`. This all assumes a
-fps of 60. If a different fps is extracted (30 or 120), specify `fps=30` or `fps=120`.
+excluding approx. the first and last second. This padding is historical baggage,
+and in principle could probably be removed, but I don't lose too much from the
+Mason dataset, so this is "future work".
 
+The following columns are contained in the output matrix:
 
-The following columns are contained in the matrix:
-
-* (6):  +60 frame trajectory x-cood at step 10 intervals
-* (6):  +60 frame trajectory z-cood at step 10 intervals
-* (6):  +60 frame trajectory body angle sin(θ) to forward
-* (6):  +60 frame trajectory body angle cos(θ) to forward
+* (6):  +60 frame trajectory x-cood at step 10 intervals.
+* (6):  +60 frame trajectory z-cood at step 10 intervals.
+* (6):  +60 frame trajectory body angle sin(θ) to forward.
+* (6):  +60 frame trajectory body angle cos(θ) to forward.
 * (6):  +60 frame trajectory path angle to root. (Derived from x/z above.)
-* (6):  +60 frame trajectory magnitude of velocity (optional)
-* (61): joint positions in Lagrangian frame (optional)
+* (6):  +60 frame trajectory magnitude of velocity (optional).
+* (6):  +60 frame boolean indicator if skeleton is performing a 360 rotation.
+* (61): joint positions in Lagrangian frame (optional).
 * (4) : foot contacts (calc. by threshold), [L ball, L toe, R ball, R toe] (optional).
-* (4) : foot contacts midpoints (see above; midpoint of each interval as binary indicator)
+* (4) : foot contacts midpoints (optional; midpoint of each interval (see above) as binary indicator).
+* (2) : leading edge of foot contacts as boolean indicator (optional).
 
-The angle θ is expressed in both sine and cosine components to avoid a
-discontinuity when it wraps around 2π (which it sometimes does). This angle
-is Lagrangian in nature too: that is, θ = 0 when the skeleton is facing in
-exactly the same direction as it is walking (i.e. the direction of the
+The most important aspect is the trajectory over the next second, contained in
+the first 12 dimensions. Since the sampling frequency may not be 60 fps
+(default), the fps used to generate the raw file may be specified as an argument
+`fps=...`. To avoid information bleed, the option `smooth_trajectory=true` will
+create a cubic spline smoothed trajectory, using the Ramer-Douglas-Peucker
+algorithm as a heuristic to find the corners. Additional knots have been
+supplied for the Mason dataset; supply `smooth_ix=...` with an integer file
+number (1..31) to add these custom knots into the smoother.
+For the body angle (θ) both sine and cosine components are used to
+avoid the discontinuity when it wraps around 2π (which it sometimes does).
+This angle is Lagrangian in nature too: that is, θ = 0 when the skeleton is
+facing in exactly the same direction as it is walking (i.e. the direction of the
 velocity). One might prefer a Eulerian (absolute) representation instead, in
-which case, pass in the named argument `direction=:absolute`.
+which case, pass in the named argument `direction=:absolute`. The body angle
+does bleed some style information due to the sway of the body during different
+gaits etc. A more agnostic option is to use `direction=:none, turn360mask=true`
+which removes the body angle inputs, and adds in the boolean indicator of a 360
+degree turn (used primarily when the skeleton turns the opposite way around a
+corner).
 
 Note that there are only 61 dimensions of the joint positions as the root x,z
 are excluded, as they are always zero. They're excluded from the output too,
@@ -364,27 +378,29 @@ most of my experiments, I have found that including the joint positions in the
 input tends to make it too easy for the model to obtain trivial predictions. To
 avoid returning any joint positions in the input matrix, select `joint_pos=false`.
 
-However since trajectory information contains no information about the phase of the
-movement, this ambiguity cannot be resolved by the model, leading to averaged
-dynamics. To resolve this, I've moved back in the direction of Holden's PFNN, but
-calculating the phase is problematic, particularly during sharp turns and standing;
-we can instead supply the foot contacts directly to the model. Use `include_ftcontact=true`.
-This feature has a drawback of heavy-footed locomotion (clompy walking!) due to the
-length of foot contact intervals. A simple alternative is to include the
-midpoint of each interval to allow differentiation of foot-up, foot-down. Specify
-using `include_ftmid=true`. (I still want to eschew deriving a phase signal: even
-in the locomotion data, this is often confused, and is anyway derived from foot contacts.)
+It is probably essential to use the information of foot contact (with the floor)
+since trajectory information contains no information about the phase of the
+movement. This ambiguity cannot be resolved by the model, leading to averaged
+dynamics. Unlike the PFNN (Holden et al.) we get around the problem of ambiguous
+phase during standing motion, as foot contacts never have ambiguity. In order to
+reduce the information bleed into the model, the options `include_ftcontact=false,
+ include_ftmid=false, lead_ft=true` may be supplied which will supply only the
+leading edge of the foot contact, a little like a metronome in 2/4. The
+`include_ftmid=true` option returns the mid points of the foot contacts, which
+could be used instead, but the dependency is no longer causal, which may be
+problematic in some instances, and is also ambiguous during standing motion.
+For a boolean vector of all (foot) contact frames, supply `include_ftcontact=true`.
 """
-function construct_inputs(raw; direction=:relative, joint_pos=true,
-        fps::Int=60, include_ftcontact=false, include_ftmid=false, speed=true)
+function construct_inputs(raw; kwargs...)
     X = reconstruct_raw(raw)
-    construct_inputs(X, raw; direction=direction, joint_pos=joint_pos, fps=fps,
-        include_ftcontact=include_ftcontact, include_ftmid=include_ftmid, speed=speed)
+    construct_inputs(X, raw; kwargs...)
 end
 
 function construct_inputs(X, raw; direction=:relative, joint_pos=true,
-        fps::Int=60, include_ftcontact=false, include_ftmid=false, speed=true)
-    @argcheck direction in [:relative, :absolute]
+        fps::Int=60, smooth_trajectory=false, turn360mask=false,
+        root_angle=true, speed=true, lead_ft=false, include_ftcontact=false,
+        include_ftmid=false, smooth_ix=0)
+    @argcheck direction in [:relative, :absolute, :none]
     @argcheck fps in [30,60,120]
     @argcheck size(X)[2:3] == (21, 3)
     @argcheck size(raw, 2) == 196
@@ -406,35 +422,62 @@ function construct_inputs(X, raw; direction=:relative, joint_pos=true,
     T = eltype(raw)
 
     # traj_pos (12x2), abs./rel. direction (12x2), abs. velocity (12), joint positions (63)
+    dirnum = direction != :none ? 12 : 0
+    anglenum = root_angle ? 6 : 0
     spnum = speed ? 6 : 0
+    turnnum = turn360mask ? 6 : 0
     jpnum = joint_pos ? 61 : 0
     ftnum = include_ftcontact  > 0 ? 4 : 0
     ftmnum = include_ftmid ? 4 : 0
-    Xs = Matrix{T}(undef, N, 30 + spnum + jpnum + ftnum + ftmnum)
+    ftlnum = lead_ft ? 2 : 0
+
+    corenum = 12 + dirnum + anglenum + spnum + turnnum
+    Xs = Matrix{T}(undef, N, corenum + jpnum + ftnum + ftmnum + ftlnum)
 
     # add rel. pos from raw
     if joint_pos
-        Xs[:, 30+spnum+1] = raw[use_ixs,9]          # x,z value of root are always zero
-        Xs[:, (30+spnum+2):(30+spnum+2+59)] = raw[use_ixs,11:70]
+        Xs[:, corenum+1] = raw[use_ixs,9]          # x,z value of root are always zero
+        Xs[:, (corenum+2):(corenum+2+59)] = raw[use_ixs,11:70]
     end
 
     if include_ftcontact > 0
-        Xs[:, (30+spnum + jpnum) .+ (1:4)] = raw[use_ixs, 4:7]
+        Xs[:, (corenum + jpnum) .+ (1:4)] = raw[use_ixs, 4:7]
     end
 
     if include_ftmid
-        extra = zeros(T, N, 4)
-        Xix2 = 30 + spnum + jpnum + ftnum
+        Xix2 = corenum + jpnum + ftnum
         for j in 1:4
             Xs[:, Xix2 + j] = mid_footcontact(raw[use_ixs, 4+j-1])
         end
     end
 
+    if lead_ft
+        Xix = corenum + jpnum + ftnum + ftmnum
+        for (store_offset, j) in enumerate(2:2:4)
+            Xs[:, Xix + store_offset] = foot_leadingedge(raw[use_ixs, 4+j-1])
+        end
+    end
+
+    root_x, root_z, root_r = raw[:, 2], raw[:, 3], raw[:, 1]
+
+    if smooth_trajectory
+        error("Not worked out smooth trajectory IK and hence root tforms etc.")
+
+        (smooth_ix <= 0) && (@warn "using default smoothing - no custom index supplied")
+        smth, corners, corner_grad = smooth_trajectory(zeros(eltype(raw), 3),
+            raw[:, 2], raw[:, 3], raw[:, 1], file_x=smooth_ix)
+        # Here we need to do IK to push the `smth` version -> raw coods.
+        # See reconstruct_modelled?
+        nothing
+        root_x, root_z, root_r = nothing
+    end
+
+
     # Calculate forward trajectory: perform FK on each trajectory segment
     # Probably faster ways to do this, but no need ∵ julia!
     for (i, rix) in enumerate(use_ixs)
         rs = rix:(rix+(Δt*6))
-        t_x, t_z = _traj_fk(zeros(T, 3), raw[rs, 2], raw[rs, 3], raw[rs, 1])
+        t_x, t_z = _traj_fk(zeros(T, 3), root_x[rs], root_z[rs], root_r[rs])
         Xs[i, 1:6] = t_x[Δt:Δt:6*Δt]
         Xs[i, 7:12] = t_z[Δt:Δt:6*Δt]
     end
@@ -458,6 +501,7 @@ function construct_inputs(X, raw; direction=:relative, joint_pos=true,
     # display(traj_vel_xz[1:end-Δ_½,:])
     # display(forward[(Δt-1):(end-Δt+Δ_½r-1), :])
     rel_angle = hcat(reverse(_trigvecs(traj_vel_xz[1:end-Δ_½,:], forward[(Δt-1):(end-Δt+Δ_½r-1), :]))...)  # sinθ, cosθ
+    turn360mask && (turn_mask = full_body_rotation_vs_forward(rel_angle[:,1], rel_angle[:,2]))
 
     # display("Rel angle2     ")
     # display(size(rel_angle))
@@ -468,21 +512,27 @@ function construct_inputs(X, raw; direction=:relative, joint_pos=true,
         if direction == :relative
             cangle = view(rel_angle, v_ixs,:)
             Xs[r, 13:24] = vec(cangle)
-        else
+        elseif direction == :absolute
             a_ixs = (ix+10):Δt:(ix+Int(60 * ϝ))
             cforward = view(forward, a_ixs, :)
             Xs[r, 13:24] = vec(cforward)
         end
 
         if speed
-            Xs[r, 31:36] = sqrt.(sum(x->x^2, cvel, dims=2)[:])
+            Xs[r, (12 + dirnum) .+ (1:6)] = sqrt.(sum(x->x^2, cvel, dims=2)[:])
         elseif include_ftcontact == 2
-            Xs[r, (30+spnum + jpnum) .+ (1:4)] *= sqrt.(sum(x->x^2, cvel, dims=2)[1])
+            Xs[r, (corenum + jpnum) .+ (1:4)] *= sqrt.(sum(x->x^2, cvel, dims=2)[1])
+        end
+
+        if turn360mask
+            Xs[r, (corenum - turnnum) .+ (1:6)] = turn_mask[v_ixs]
         end
 
     end
 
-    Xs[:, 25:30] = atan.(Xs[:, 1:6], Xs[:, 7:12])
+    if root_angle
+        Xs[:, (corenum - turnnum - anglenum) .+ (1:6)] = atan.(Xs[:, 1:6], Xs[:, 7:12])
+    end
 
     return Xs
 end
@@ -507,6 +557,25 @@ end
 function mid_footcontact(u)
     mid_footcontact!(fill!(similar(u), 0), u)
 end
+
+function smooth_footcontacts(u)
+    # HMM values are chosen rather than learned, but work well in practice.
+    # First categorical distn has p=0.9 to emit '0', second has p=0.8 to emit
+    # '1'. (The 'contact' threshold is close to the ground, and can be noisy
+    # when near boundary.) Transition matrix is symmetric with inertia 0.9.
+    hmm = HMM([0.9 0.1; 0.1 0.9], [DiscreteNonParametric([0,1], [0.9,0.1]),
+              DiscreteNonParametric([0,1], [0.2,0.8])])
+    return viterbi(hmm, u) .- 1;
+end
+
+function foot_leadingedge(u)
+    u = smooth_footcontacts(u)
+    return vcat(false, diff(u) .== -1)
+end
+#= -----------------------------------------------------------------------
+        Smoothing and corner detection via splines (moved to sep. file)
+   ----------------------------------------------------------------------- =#
+include("./input_smooth.jl")
 
 
 """
@@ -568,6 +637,7 @@ function reconstruct_modelled(Y::Matrix)
     joints = hcat(rootjoint, joints)
     return _joints_fk(joints, root_x, root_z, root_r)
 end
+
 
 
 #= -----------------------------------------------------------------------
