@@ -71,8 +71,13 @@ _qimag = Quaternions.imag
 _quat_list(x) = [quat(x[i,:]) for i in 1:size(x,1)]
 _quat_list_to_mat(x) = reduce(vcat, [_qimag(xx)' for xx in x])
 _quaterion_angle_axis_w_y(θ) = quat(cos(θ/2), 0, sin(θ/2), 0)
+_xz_plane_angle(q::Quaternion) = begin; @assert q.v1 ≈ 0 && q.v3 ≈ 0; atan(q.v2, q.s)*2; end  # inverse of above
 _apply_rotation(x, qrot) = qrot * x * conj(qrot)
 
+cat_zero_y(x::T, z::T) where T <: Number = [x, 0, z]
+cat_zero_y(x::Vector{T}, z::Vector{T}) where T = hcat(x, zeros(T, length(x)), z)
+cat_zero_y(X::Matrix{T}) where T = begin; @argcheck size(X,2)==2;
+    hcat(X[:,1], zeros(T, size(X,1)), X[:,2]); end
 
 # _-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-
 
@@ -212,7 +217,7 @@ function process_file(filename; fps::Int=60, smooth_footc::Int=0)
     # Get Root Velocity
     velocity = diff(positions[:,1:1,:], dims=1)
 
-    # Remove translation
+    # Remove translation from non-root joints
     positions[:,:,1] .-= positions[:,1:1,1]
     positions[:,:,3] .-= positions[:,1:1,3]
 
@@ -234,14 +239,9 @@ function process_file(filename; fps::Int=60, smooth_footc::Int=0)
     root_rotation = Quatpy.Quaternions.between(forward, target)
     root_rotation.qs = _unsqueeze(root_rotation.qs, 2);
     root_rot_omitlast = _QuatpyGetItem(root_rotation, 1:(N-1))
-    rvelocity = (_QuatpyGetItem(root_rotation, 2:N) * -root_rot_omitlast).to_pivots()
+    # rvelocity = (_QuatpyGetItem(root_rotation, 2:N) * -root_rot_omitlast).to_pivots()
 
-    # Local Space  # NEW: define position of joints relative to root
-    local_positions = positions  # copy(positions)
-    local_positions[:,:,1] .-= local_positions[:,1:1,1]  # x rel to root x
-    local_positions[:,:,3] .-= local_positions[:,1:1,3]  # z rel to root z
-
-    local_positions = root_rot_omitlast * local_positions[1:end-1,:,:]  |> _toArray # remove Y rotation from pos
+    local_positions = root_rot_omitlast * positions[1:end-1,:,:]  |> _toArray # remove Y rotation from pos
     local_velocities = diff(local_positions, dims=1)
     local_rotations = abs((root_rot_omitlast * _QuatpyGetItem(global_rotations, 1:(N-1)))).log()
 
@@ -266,38 +266,42 @@ end
 
 
 
-"""
-    reconstruct_raw(Y)
 
-This reconstructs the absolute positions of joints in a contiguous set of frames
-from the raw matrix output of `process_file`. This proceeds by applying forward
-kinematics using the root rotation from the Lagrangian representation, and the
-x-z root velocities of the first few dims of the processed matrix.
-"""
-reconstruct_raw(Y::Matrix) = _multiplex_fk(Y, :raw)
-
+reconstruct_modelled(Y::Matrix) = reconstruct(Y, :modelled)
+reconstruct_raw(Y::Matrix) = reconstruct(Y, :raw)
+reconstruct_root(Y::Matrix) = reconstruct(Y, :root)[:,1,:]
 
 """
-    reconstruct_modelled(Y)
+    reconstruct(Y, input_type)
 
-This reconstructs the absolute positions of joints in a contiguous set of frames
-from a model matrix with the same columns as the output of `construct_outputs`.
+Reconstruct the absolute positions of joints in a contiguous set of frames.
 This proceeds by applying forward kinematics using the root rotation from the
 Lagrangian representation, and the x-z root velocities of the first few dims of
-the `Y` matrix.
+the processed matrix.
+
+See also shortcuts:
+    reconstruct_modelled(Y)
+    reconstruct_raw(Y)
+    reconstruct_root(Y)
 """
-reconstruct_modelled(Y::Matrix) = _multiplex_fk(Y, :modelled)
 
-
-function _multiplex_fk(Y::Matrix, input_type::Symbol)
+function reconstruct(Y::Matrix{T}, input_type::Symbol) where T <: Number
     Y = convert(Matrix{Float64}, Y)   # reduce error propagation from iterative scheme
     if input_type == :raw
+        (size(Y, 2) < 70) && @warn "expecting matrix with >= 70 columns"
         root_r, root_x, root_z, joints = Y[:,1], Y[:,2], Y[:,3], Y[:,8:(63+7)]
+
     elseif input_type == :modelled
+        (size(Y, 2) != 64) && @warn "expecting matrix with exactly 64 columns"
         N = size(Y, 1)
         root_r, root_x, root_z, joints = Y[:,1], Y[:,2], Y[:,3], Y[:,5:end]
         rootjoint = reduce(hcat,  (zeros(T, N, 1), Y[:,4:4], zeros(T, N, 1)))
         joints = hcat(rootjoint, joints)
+
+    elseif input_type == :root
+        (size(Y, 2) != 3) && @warn "expecting matrix with exactly 3 columns"
+        root_r, root_x, root_z = Y[:,1], Y[:,2], Y[:,3]
+        joints = zeros(size(Y,1), 3)   # (implicitly starting at the origin.)
     end
 
     return _joints_fk(joints, root_x, root_z, root_r)
@@ -345,6 +349,57 @@ function _traj_fk(start::Vector{T}, root_x::Vector{T}, root_z::Vector{T}, root_r
     end
 
     return traj[1,:], traj[3,:]
+end
+
+
+# ================== INVERSE KINEMATICS ======================
+
+"""
+    _traj_invk(root_xz::Matrix{T}, root_gradient::Matrix{T})
+
+INVERSE KINEMATICS FOR ROOT JOINT.
+
+This function was derived not to (necc) be the true IK, but in order that
+FK(IK(x)) = x, i.e. a no-op. This allows us to apply any changes directly
+back onto the original data.
+"""
+function _traj_invk(root_xz::Matrix{T}, root_gradient::Matrix{T}) where T <: Number
+    N = size(root_xz, 1)
+
+    # Find "difference" in Eulerian rotation between each frame
+    # (note that due to discretisation error, propagated throughout this entire
+    # file, we cannot use the derivative, even if we have access to it (i.e.
+    # splines) and must instead calc. the inverse operation of FK.)
+    target = repeat([0,0,1]', N, 1)
+    forward = cat_zero_y(root_gradient)
+    forward ./= sqrt.(sum(x->x^2, forward, dims=2)) # normalise
+    root_rotation = mocapio.Quatpy.Quaternions.between(forward, target).qs
+
+    # This commented line is what is in the original IK code in Holden/Mason,but
+    # is not the inverse of what is in the FK code: I'm doing the actual inverse.
+#     root_rvelocity = mocapio.Pivotspy.Pivots.from_quaternions(
+#         mocapio._QuatpyGetItem(root_rotation, 2:N) * -root_rot_omitlast).ps
+
+    # Calculate the difference in each rotation via the inverse of FK. Let the
+    # Eulerian angle be r_t and the incremental angle be ρ_t. Then we have
+    # r_t = \prod_{i=1}^t ρ_i   ⇒   ρ_t = r_t \prod_{i=t-1}^1 ρ_i^{-1}
+    root_rvelocity = [quat(root_rotation_jl[1,:]...)]
+    c_inv = quat(1.0)
+    for i in 2:N
+        c_inv *= inv(root_rvelocity[i-1])
+        push!(root_rvelocity, quat(root_rotation_jl[i,:]...) * c_inv)
+    end
+    root_rvelocity = map(_xz_plane_angle, root_rvelocity)
+
+    # Calculate the x and z offsets for the Lagrangian frame.
+    steps = diff(root_xz, dims=1)
+    global_steps = Matrix{T}(undef, size(steps, 1), 3)
+    for i = 1:size(steps, 1)
+        qrot = quat(root_rotation[i,:]...)
+        global_steps[i,:] = _qimag(_apply_rotation(
+                                quat([steps[i, 1], 0, steps[i,2]]), qrot))
+    end
+    return vec(root_rvelocity), global_steps[:,1], global_steps[:,3]
 end
 
 """
