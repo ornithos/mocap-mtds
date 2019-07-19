@@ -176,7 +176,7 @@ function process_file(filename; fps::Int=60, smooth_footc::Int=0)
     fps_step = Dict(120=>1, 60=>2, 30=>4)[fps]
     anim = get(anim,  range(0, length(anim)-1, step=fps_step))
 
-    # Do FK
+    # Do FK down --> skeleton joints
     global_xforms = Animpy.transforms_global(anim)  # intermediate
     global_positions = global_xforms[:,:,1:3,4] ./ global_xforms[:,:,4:end,4]
     global_rotations = Quatpy.Quaternions.from_transforms(global_xforms)
@@ -274,12 +274,35 @@ from the raw matrix output of `process_file`. This proceeds by applying forward
 kinematics using the root rotation from the Lagrangian representation, and the
 x-z root velocities of the first few dims of the processed matrix.
 """
-function reconstruct_raw(Y::Matrix)
-    Y = convert(Matrix{Float64}, Y)   # reduce error propagation from iterative scheme
+reconstruct_raw(Y::Matrix) = _multiplex_fk(Y, :raw)
 
-    root_r, root_x, root_z, joints = Y[:,1], Y[:,2], Y[:,3], Y[:,8:(63+7)]
+
+"""
+    reconstruct_modelled(Y)
+
+This reconstructs the absolute positions of joints in a contiguous set of frames
+from a model matrix with the same columns as the output of `construct_outputs`.
+This proceeds by applying forward kinematics using the root rotation from the
+Lagrangian representation, and the x-z root velocities of the first few dims of
+the `Y` matrix.
+"""
+reconstruct_modelled(Y::Matrix) = _multiplex_fk(Y, :modelled)
+
+
+function _multiplex_fk(Y::Matrix, input_type::Symbol)
+    Y = convert(Matrix{Float64}, Y)   # reduce error propagation from iterative scheme
+    if input_type == :raw
+        root_r, root_x, root_z, joints = Y[:,1], Y[:,2], Y[:,3], Y[:,8:(63+7)]
+    elseif input_type == :modelled
+        N = size(Y, 1)
+        root_r, root_x, root_z, joints = Y[:,1], Y[:,2], Y[:,3], Y[:,5:end]
+        rootjoint = reduce(hcat,  (zeros(T, N, 1), Y[:,4:4], zeros(T, N, 1)))
+        joints = hcat(rootjoint, joints)
+    end
+
     return _joints_fk(joints, root_x, root_z, root_r)
 end
+
 
 function _joints_fk(joints::Matrix{T}, root_x::Vector{T}, root_z::Vector{T},
         root_r::Vector{T}) where T <: Number
@@ -615,27 +638,6 @@ function construct_outputs(raw; include_ftcontact=true, fps::Int=60)
         return reduce(hcat, (raw[ixs, 1:3], raw[ixs, 9:9], raw[ixs, 11:(63+7)],
                              raw[ixs, 4:7]))
     end
-end
-
-
-"""
-    reconstruct_modelled(Y)
-
-This reconstructs the absolute positions of joints in a contiguous set of frames
-from a model matrix with the same columns as the output of `construct_outputs`.
-This proceeds by applying forward kinematics using the root rotation from the
-Lagrangian representation, and the x-z root velocities of the first few dims of
-the `Y` matrix.
-"""
-function reconstruct_modelled(Y::Matrix)
-    Y = convert(Matrix{Float64}, Y)   # reduce error propagation from iterative scheme
-    T = eltype(Y)
-    N = size(Y, 1)
-
-    root_r, root_x, root_z, joints = Y[:,1], Y[:,2], Y[:,3], Y[:,5:(60+4)]
-    rootjoint = reduce(hcat,  (zeros(T, N, 1), Y[:,4:4], zeros(T, N, 1)))
-    joints = hcat(rootjoint, joints)
-    return _joints_fk(joints, root_x, root_z, root_r)
 end
 
 
