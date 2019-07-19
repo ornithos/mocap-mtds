@@ -164,15 +164,16 @@ addl_discont = Dict(28=>[3455], 30=>[264])
 
 function smooth_trajectory(start::Vector{T}, root_x::Vector{T}, root_z::Vector{T},
         root_r::Vector{T}, file_ix::Int=0, turn_thrsh::Float64=0.15) where T
-    trj = _traj_fk(start, root_x, root_z, root_y);
+    trj = _traj_fk(start, root_x, root_z, root_r);
     ϵ = get(epsilons, file_ix, 0.7)  # default 0.7, o.w. see above for epsilon
     ix_rng = 1:length(root_x)    # neccesary ∵ bug atm in mocapio which triples length of output
     traj_mat = hcat(trj[1][ix_rng], trj[2][ix_rng])
 
-    # Do RDP transform and extract knots
+    # Do RDP transform and extract knots.
     simplified = rdp(traj_mat, ϵ)
-    ts = map(1:size(x,1)) do i
-            findfirst((x[i,1] .≈ traj_mat[:,1]) .& (x[i,2] .≈ traj_mat[:,2]))
+    # Is there a better way to find indices of the returned? Yes. But here we are...
+    ts = map(1:size(simplified,1)) do i
+            findfirst((simplified[i,1] .≈ traj_mat[:,1]) .& (simplified[i,2] .≈ traj_mat[:,2]))
     end
 
     # Find additional turning points by looking at large large second "derivatives" (differences)
@@ -198,6 +199,7 @@ function smooth_trajectory(start::Vector{T}, root_x::Vector{T}, root_z::Vector{T
         knots_ix = sort(vcat(knots_ix, get(addl_discont, file_ix, [])));
 
     else
+        knots[ts] .= 1
         knots_ix = findall(merge_knots(knots; take_first=false, merge_triplets=false));
     end
 
@@ -222,10 +224,10 @@ function smooth_trajectory(start::Vector{T}, root_x::Vector{T}, root_z::Vector{T
     sharp_turns = abs.(g) .> turn_thrsh
     turn_window = 10
     for ix in findall(sharp_turns)   # smoosh...
-        sharp_turns[max(0, ix-turn_window):min(N, ix+turn_window)] .= true
+        sharp_turns[max(1, ix-turn_window):min(N-1, ix+turn_window)] .= true
     end
 
-    return smoothed_trj, findall(sharp_turns), g[sharp_turns]
+    return smoothed_trj, smoothed_deriv, findall(sharp_turns), g
 end
 
 
