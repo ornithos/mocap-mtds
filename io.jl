@@ -6,11 +6,6 @@ using ProgressMeter, Formatting, ArgCheck # small utils libraries
 using HMMBase        # for smoothing foot contacts
 using Distributions: DiscreteNonParametric   # for smoothing foot contacts, like a Categorical distn.
 
-# Read a string from STDIN. The trailing newline is stripped. https://stackoverflow.com/a/23342933
-function input(prompt::String="")::String
-   print(prompt)
-   return chomp(readline())
-end
 
 # ##############################################################################
 # Python interface to reuse Dan Holden's code
@@ -74,13 +69,24 @@ _quaterion_angle_axis_w_y(θ) = quat(cos(θ/2), 0, sin(θ/2), 0)
 _xz_plane_angle(q::Quaternion) = begin; @assert q.v1 ≈ 0 && q.v3 ≈ 0; atan(q.v2, q.s)*2; end  # inverse of above
 _apply_rotation(x, qrot) = qrot * x * conj(qrot)
 
+# trajectory is represented as (x,z), but most quaternion ops need y (=0) too.
 cat_zero_y(x::T, z::T) where T <: Number = [x, 0, z]
 cat_zero_y(x::Vector{T}, z::Vector{T}) where T = hcat(x, zeros(T, length(x)), z)
 cat_zero_y(X::Matrix{T}) where T = begin; @argcheck size(X,2)==2;
     hcat(X[:,1], zeros(T, size(X,1)), X[:,2]); end
 
-# _-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-
+# Non-quaternion (2D) rotation opterations.
+_rot_matrix(θ) = [cos(θ) -sin(θ); sin(θ) cos(θ)]
+_rotate2d(X::AbstractMatrix, θ::Real) = begin; @assert size(X,2)==2; X * _rot_matrix(θ); end
+_rotate2d(X::AbstractMatrix, y::Real, x::Real) = begin; z = [y, x]; z/=norm(z); _rotate2d(X, atan(z...)); end
+_antirotate2d(X::AbstractMatrix, θ::Real) = _rotate2d(X, -θ);
+_antirotate2d(X::AbstractMatrix, y::Real, x::Real) = _rotate2d(X, -y, x);
 
+# Read a string from STDIN. The trailing newline is stripped. https://stackoverflow.com/a/23342933
+function input(prompt::String="")::String
+   print(prompt)
+   return chomp(readline())
+end
 
 """
     bvh_frames_approx(filename(s))
@@ -145,6 +151,11 @@ function _trigvecs(A::Matrix{T}, B::Matrix{T}) where T <: Number
     return cosθ, sinθ
 end
 
+# _-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-
+
+# ##############################################################################
+# Main input / output processing functions.
+# ##############################################################################
 
 """
     process_file(filename)
@@ -264,8 +275,10 @@ function process_file(filename; fps::Int=60, smooth_footc::Int=0)
 end
 
 
-
-
+#= ---------------------------------------------------------------------------
+          FORWARD KINEMATICS (for Lagrangian skeleton representation)
+       These functions used some of Holden's view.py as a starting point.
+------------------------------------------------------------------------------=#
 
 reconstruct_modelled(Y::Matrix) = reconstruct(Y, :modelled)
 reconstruct_raw(Y::Matrix) = reconstruct(Y, :raw)
@@ -284,7 +297,6 @@ See also shortcuts:
     reconstruct_raw(Y)
     reconstruct_root(Y)
 """
-
 function reconstruct(Y::Matrix{T}, input_type::Symbol) where T <: Number
     Y = convert(Matrix{Float64}, Y)   # reduce error propagation from iterative scheme
     if input_type == :raw
@@ -309,59 +321,76 @@ end
 
 
 function _joints_fk(joints::Matrix{T}, root_x::Vector{T}, root_z::Vector{T},
-        root_r::Vector{T}) where T <: Number
+        root_r::Vector{T}; start::Vector{T}=zeros(T, 3)) where T <: Number
 
     n = size(joints, 1)
     njoints = size(joints, 2) ÷ 3
     @assert (njoints * 3 == size(joints, 2)) "number of columns must be div. 3"
     joints = _rowmaj_reshape_3d(joints, n, njoints, 3)
-#     joints = reshape(joints, n, 3, 21)
-#     joints = permutedims(joints, [1,3,2])
     rotation = Quaternion(1.0)
     offsets = []
-    translation = zeros(3)
+    translation = start
 
     for i = 1:n
+        # Apply the rotation to the skeleton about the y axis
+        # so that the azimuth at the **END** of the step is correct.
         joints[i,:,:] = _apply_rotation(_quat_list(joints[i,:,:]), rotation) |> _quat_list_to_mat
+
+        # Move from origin --> calculated next step (see below for def.)
+        # Note that this does not happen wrt current azimuth, and so is
+        # **INDEPENDENT OF THE ABOVE ROTATION**.
         joints[i,:,1] = joints[i,:,1] .+ translation[1]
         joints[i,:,3] = joints[i,:,3] .+ translation[3]
 
+        # Increment the cumulative y-axis rotation by next rotational difference.
         rotation = _quaterion_angle_axis_w_y(-root_r[i]) * rotation
-        append!(offsets, _apply_rotation(quat(0.,0,0,1), rotation))
-        translation = translation + _qimag(_apply_rotation(quat(0., root_x[i], 0, root_z[i]), rotation))
+
+        # Rotate the next delta (step; x,z diff) and express relative to origin.
+        next_step = quat(cat_zero_y(root_x[i], root_z[i]))
+        rotated_step = _qimag(_apply_rotation(next_step, rotation))
+        translation += rotated_step
     end
 
+    # note that vs the trajectory FK, we don't obtain an (n+1) output. This is
+    # because while we know the position of the root at time (n+1), we don't
+    # have the relative position of the joints, and so discard this final transformation.
     return joints
 end
 
 
-function _traj_fk(start::Vector{T}, root_x::Vector{T}, root_z::Vector{T}, root_r::Vector{T}) where T <: Number
-    rotation = Quaternion(1.0)
-    translation = zeros(3)
+function _traj_fk(root_x::Vector{T}, root_z::Vector{T}, root_r::Vector{T};
+        start::Vector{T}=zeros(T, 3)) where T <: Number
+
     n = length(root_x)
-    traj = repeat(start, 1, n+1);
+    rotation = Quaternion(1.0)
+    translation = start
+    traj = Matrix{T}(undef, 3, n);
+
     for i = 1:n
-        traj[:, i+1] = _qimag(_apply_rotation(quat(traj[:, i+1]), rotation))
-        traj[1, i+1] += translation[1]
-        traj[3, i+1] += translation[3]
+        traj[1, i] = translation[1]
+        traj[3, i] = translation[3]
         rotation = _quaterion_angle_axis_w_y(-root_r[i]) * rotation
-        translation = translation + _qimag(_apply_rotation(quat(0., root_x[i], 0, root_z[i]), rotation))
+        next_step = quat(cat_zero_y(root_x[i], root_z[i]))
+        translation = translation + _qimag(_apply_rotation(next_step, rotation))
     end
 
+    traj = hcat(start, traj)
     return traj[1,:], traj[3,:]
 end
 
 
-# ================== INVERSE KINEMATICS ======================
+#= ---------------------------------------------------------------------------
+          INVERSE KINEMATICS (to Lagrangian skeleton representation)
+------------------------------------------------------------------------------=#
 
 """
     _traj_invk(root_xz::Matrix{T}, root_gradient::Matrix{T})
 
 INVERSE KINEMATICS FOR ROOT JOINT.
 
-This function was derived not to (necc) be the true IK, but in order that
-FK(IK(x)) = x, i.e. a no-op. This allows us to apply any changes directly
-back onto the original data.
+This function was derived in order that FK(IK(x)) = x, i.e. a no-op. Therefore
+if the FK ops have a bug, this fn has the inverse bug (hopefully). This allows
+us to apply any changes in trajectory space directly back onto the original data.
 """
 function _traj_invk(root_xz::Matrix{T}, root_gradient::Matrix{T}) where T <: Number
     N = size(root_xz, 1)
@@ -383,13 +412,15 @@ function _traj_invk(root_xz::Matrix{T}, root_gradient::Matrix{T}) where T <: Num
     # Calculate the difference in each rotation via the inverse of FK. Let the
     # Eulerian angle be r_t and the incremental angle be ρ_t. Then we have
     # r_t = \prod_{i=1}^t ρ_i   ⇒   ρ_t = r_t \prod_{i=t-1}^1 ρ_i^{-1}
-    root_rvelocity = [quat(root_rotation_jl[1,:]...)]
+    root_rvelocity = [quat(root_rotation[1,:]...)]
     c_inv = quat(1.0)
     for i in 2:N
         c_inv *= inv(root_rvelocity[i-1])
-        push!(root_rvelocity, quat(root_rotation_jl[i,:]...) * c_inv)
+        push!(root_rvelocity, quat(root_rotation[i,:]...) * c_inv)
     end
     root_rvelocity = map(_xz_plane_angle, root_rvelocity)
+    root_rvelocity = root_rvelocity[2:end]   # o.w assuming that start from 0, which we haven't specified,
+                                             # also o.w. is diff length to x and z.
 
     # Calculate the x and z offsets for the Lagrangian frame.
     steps = diff(root_xz, dims=1)
@@ -403,10 +434,10 @@ function _traj_invk(root_xz::Matrix{T}, root_gradient::Matrix{T}) where T <: Num
 end
 
 """
-    construct_inputs(raw [; direction=:relative, joint_pos=true,
-            fps::Int=60, smooth_trajectory=false, turn360mask=false,
+    construct_inputs(raw [; direction=:relative, joint_pos=true, traj_abs=false,
+            fps::Int=60, smooth=false, turn360mask=false,
             root_angle=true, speed=true, lead_ft=false, include_ftcontact=false,
-            include_ftmid=false, smooth_ix=0)
+            include_ftmid=false, smooth_ix=0])
 
 Construct the input matrix for the mocap models. The input `raw` is the raw
 output from the `process_file` function. The function outputs the following
@@ -419,10 +450,11 @@ The following columns are contained in the output matrix:
 
 * (6):  +60 frame trajectory x-cood at step 10 intervals.
 * (6):  +60 frame trajectory z-cood at step 10 intervals.
+* (12): +60 frame trajectory (x,z) absolute cood version of above.
 * (6):  +60 frame trajectory body angle sin(θ) to forward.
 * (6):  +60 frame trajectory body angle cos(θ) to forward.
-* (6):  +60 frame trajectory path angle to root. (Derived from x/z above.)
 * (6):  +60 frame trajectory magnitude of velocity (optional).
+* (6):  +60 frame trajectory path angle to root. (optional, derived from x/z above.)
 * (6):  +60 frame boolean indicator if skeleton is performing a 360 rotation.
 * (61): joint positions in Lagrangian frame (optional).
 * (4) : foot contacts (calc. by threshold), [L ball, L toe, R ball, R toe] (optional).
@@ -475,7 +507,7 @@ function construct_inputs(raw; kwargs...)
 end
 
 function construct_inputs(X, raw; direction=:relative, joint_pos=true,
-        fps::Int=60, smooth_trajectory=false, turn360mask=false,
+        traj_abs=false, fps::Int=60, smooth=false, turn360mask=false,
         root_angle=true, speed=true, lead_ft=false, include_ftcontact=false,
         include_ftmid=false, smooth_ix=0)
     @argcheck direction in [:relative, :absolute, :none]
@@ -500,6 +532,7 @@ function construct_inputs(X, raw; direction=:relative, joint_pos=true,
     T = eltype(raw)
 
     # traj_pos (12x2), abs./rel. direction (12x2), abs. velocity (12), joint positions (63)
+    trajanum = traj_abs ? 12 : 0
     dirnum = direction != :none ? 12 : 0
     anglenum = root_angle ? 6 : 0
     spnum = speed ? 6 : 0
@@ -509,9 +542,10 @@ function construct_inputs(X, raw; direction=:relative, joint_pos=true,
     ftmnum = include_ftmid ? 4 : 0
     ftlnum = lead_ft ? 2 : 0
 
-    corenum = 12 + dirnum + anglenum + spnum + turnnum
+    corenum = 12 + trajanum + dirnum + anglenum + spnum + turnnum
     Xs = Matrix{T}(undef, N, corenum + jpnum + ftnum + ftmnum + ftlnum)
 
+    #################### EASY INPUTS TO RESOLVE ###############################
     # add rel. pos from raw
     if joint_pos
         Xs[:, corenum+1] = raw[use_ixs,9]          # x,z value of root are always zero
@@ -536,31 +570,64 @@ function construct_inputs(X, raw; direction=:relative, joint_pos=true,
         end
     end
 
-    root_x, root_z, root_r = raw[:, 2], raw[:, 3], raw[:, 1]
+    #################### PREPARATION FOR TRAJECTORY ############################
 
-    if smooth_trajectory
-        error("Not worked out smooth trajectory IK and hence root tforms etc.")
-
+    # Inverse Kinematics (dims 1:12)
+    if smooth
         (smooth_ix <= 0) && (@warn "using default smoothing - no custom index supplied")
-        smth, corners, corner_grad = smooth_trajectory(zeros(eltype(raw), 3),
-            raw[:, 2], raw[:, 3], raw[:, 1], file_x=smooth_ix)
-        # Here we need to do IK to push the `smth` version -> raw coods.
-        # See reconstruct_modelled?
-        nothing
-        root_x, root_z, root_r = nothing
+
+        # perform FK and smooth the resulting root trajectory
+        strj, s∇, turns, sθg = smooth_trajectory(zeros(eltype(raw), 3),
+            raw[:, 2], raw[:, 3], raw[:, 1], file_ix=smooth_ix)
+
+        # Inverse Kinematics of smoothed trajectory => smoothed lagrange
+        slagr_r, slagr_x, slagr_z = _traj_invk(strj, s∇);
+
+        # recall that the 'root' here is in currently in Lagrangian form.
+        root_r, root_x, root_z = slagr_r, slagr_x, slagr_z
+    else
+        root_x, root_z, root_r = raw[:, 2], raw[:, 3], raw[:, 1]
     end
 
+    # [optional] Absolute trajectory (Forward Kinematics) (dims 12:24)
+    if traj_abs
+        _hcat2(x) = hcat(x[1], x[2])
 
+        ext_ixs = use_ixs.start:(use_ixs.stop + 6*Δt)
+        if !smooth
+            abs_trj = mocapio._traj_fk(raw[ext_ixs, 2], raw[ext_ixs, 3], raw[ext_ixs, 1]) |> _hcat2
+        else
+            # Absolute trajectory is offset from origin / rotated due to truncation |> FK
+            # This will be ~different to smoothed offset, so find orig offset, then apply to `strj`.
+            # Find difference between original start and truncated start
+            trj_orig = mocapio._traj_fk(raw[:, 2], raw[:, 3], raw[:, 1]) |> _hcat2
+            δ_orig = (trj_orig[t₀:t₀,:] - trj_orig[1:1,:])
+
+            # apply to smoothed trajectory
+            abs_trj = strj[ext_ixs,:] .- δ_orig
+            abs_trj = _antirotate2d(abs_trj, δ_orig...)
+        end
+    end
+
+    ######################### STORE TRAJECTORY ################################
     # Calculate forward trajectory: perform FK on each trajectory segment
     # Probably faster ways to do this, but no need ∵ julia!
     for (i, rix) in enumerate(use_ixs)
+
+        # Relative trajectory at each time t
         rs = rix:(rix+(Δt*6))
-        t_x, t_z = _traj_fk(zeros(T, 3), root_x[rs], root_z[rs], root_r[rs])
+        t_x, t_z = _traj_fk(root_x[rs], root_z[rs], root_r[rs])
         Xs[i, 1:6] = t_x[Δt:Δt:6*Δt]
         Xs[i, 7:12] = t_z[Δt:Δt:6*Δt]
+
+        # Absolute trajectory at each time t
+        if traj_abs
+            Xs[i, 12 .+ (1:6)] = abs_trj[(Δt:Δt:6*Δt) .+ i, 1]
+            Xs[i, 12 .+ (7:12)] = abs_trj[(Δt:Δt:6*Δt) .+ i, 2]
+        end
     end
 
-    # Calculate body direction and velocity
+    #################### BODY DIRECTION AND VELOCITY ###########################
     # ---------------------------------------
     # Calculate forward direction (same as process_file, but different reference frame)
     sdr_l, sdr_r, hip_l, hip_r = 14, 18, 2, 6  #13, 17, 1, 5
@@ -589,15 +656,15 @@ function construct_inputs(X, raw; direction=:relative, joint_pos=true,
 
         if direction == :relative
             cangle = view(rel_angle, v_ixs,:)
-            Xs[r, 13:24] = vec(cangle)
+            Xs[r, trajanum .+ (13:24)] = vec(cangle)
         elseif direction == :absolute
             a_ixs = (ix+10):Δt:(ix+Int(60 * ϝ))
             cforward = view(forward, a_ixs, :)
-            Xs[r, 13:24] = vec(cforward)
+            Xs[r, trajanum .+ (13:24)] = vec(cforward)
         end
 
         if speed
-            Xs[r, (12 + dirnum) .+ (1:6)] = sqrt.(sum(x->x^2, cvel, dims=2)[:])
+            Xs[r, (12 + trajanum + dirnum) .+ (1:6)] = sqrt.(sum(x->x^2, cvel, dims=2)[:])
         elseif include_ftcontact == 2
             Xs[r, (corenum + jpnum) .+ (1:4)] *= sqrt.(sum(x->x^2, cvel, dims=2)[1])
         end
@@ -650,6 +717,7 @@ function foot_leadingedge(u)
     u = smooth_footcontacts(u)
     return vcat(false, diff(u) .== -1)
 end
+
 #= -----------------------------------------------------------------------
         Smoothing and corner detection via splines (moved to sep. file)
    ----------------------------------------------------------------------- =#
@@ -681,25 +749,41 @@ argument.
 
 """
 function construct_outputs(raw; include_ftcontact=true, fps::Int=60)
+
     @argcheck size(raw, 2) == 196
     @argcheck fps in [30,60,120]
     ϝ = fps/60
     t₀, t₁, Δt = Int(60 * ϝ),  size(raw, 1) - Int(70 * ϝ), Int(10 * ϝ)
 
+    # if smooth
+    #     (smooth_ix <= 0) && (@warn "using default smoothing - no custom index supplied")
+    #
+    #     # perform FK and smooth the resulting root trajectory
+    #     strj, s∇, turns, sθg = smooth_trajectory(zeros(eltype(raw), 3),
+    #         raw[:, 2], raw[:, 3], raw[:, 1], file_x=smooth_ix)
+    #
+    #     # Inverse Kinematics wrt *smoothed forward direction* (s∇, since grad
+    #     # is tangent to trajectory), but raw ()
+    #     slagr_r, lagr_x, lagr_z = _traj_invk(hcat(raw[ixs, 1], raw[ixs,3]), s∇);
+    #     root = hcat(slagr_r, lagr_x, lagr_z)
+    # end
+    root = raw[:, 1:3]
     ixs = range(t₀, stop=t₁)
-    if !include_ftcontact
-        return reduce(hcat, (raw[ixs, 1:3], raw[ixs, 9:9], raw[ixs, 11:(63+7)]))
-    else
-        return reduce(hcat, (raw[ixs, 1:3], raw[ixs, 9:9], raw[ixs, 11:(63+7)],
-                             raw[ixs, 4:7]))
+    Y = reduce(hcat, (root[ixs,:], raw[ixs, 9:9], raw[ixs, 11:(63+7)]))
+
+    if include_ftcontact
+        Y = hcat(Y, raw[ixs, 4:7])
     end
+    return Y
 end
 
+# _-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-
 
 
-#= -----------------------------------------------------------------------
-                Utilities for accessing data
-   ----------------------------------------------------------------------- =#
+
+# ##############################################################################
+# Utilities for accessing data
+# ##############################################################################
 
 mutable struct ExperimentData{MT <: AbstractMatrix}
     YsRaw::Vector{MT}

@@ -207,9 +207,13 @@ function create_animation(data::Vector, names::Union{String, Array{String}}="dat
                     settransform_collection!(frame[names[i]], lines, joints; anim=true)  # note order: lines at back, joints at front
 
                     if i <= npaths
-                        trail = randn(5,3)*0.001   # base case: all segments have positive length
+                        trail = randn(5,3)*0.001   # case i=1: all segments need positive length (Meshcat reqmt.)
                         trail_ixs = max(tt-41, 1):10:(tt-1)
-                        trail[(6-length(trail_ixs)):5, :] = project_ground(data[i][trail_ixs, 1, reord])
+                        if false
+                            trail[(6-length(trail_ixs)):5, :] = project_ground(data[i][trail_ixs, 1, reord])
+                        else
+                            trail[(6-length(trail_ixs)):5, :] = hcat(path[i][trail_ixs, 1], path[i][trail_ixs, 7], zeros(length(trail_ixs)))
+                        end
                         path_matrix = vcat(trail, hcat(reshape(path[i][tt, :], 6, 2), zeros(6)))*scale
                         update_pos!(pathlines, path_matrix[1:10,:], path_matrix[2:11,:])
                         settransform_collection!(frame[names[i]], pathlines; anim=true)
