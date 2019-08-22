@@ -68,6 +68,9 @@ _quat_list_to_mat(x) = reduce(vcat, [_qimag(xx)' for xx in x])
 _quaterion_angle_axis_w_y(θ) = quat(cos(θ/2), 0, sin(θ/2), 0)
 _xz_plane_angle(q::Quaternion) = begin; @assert q.v1 ≈ 0 && q.v3 ≈ 0; atan(q.v2, q.s)*2; end  # inverse of above
 _apply_rotation(x, qrot) = qrot * x * conj(qrot)
+_vec4_to_quat(x::Vector) = begin; @argcheck length(x) == 4; Quaternion(x[1], x[2], x[3], x[4]); end  # quat constructor is WEIRD o.w.
+_vec2_to_quat(x::Vector) = begin; @argcheck length(x) == 2;
+    Quatpy.Quaternions.between([0,0,1], cat_zero_y(x[1], x[2])).qs[1,:] |> _vec4_to_quat; end
 
 # trajectory is represented as (x,z), but most quaternion ops need y (=0) too.
 cat_zero_y(x::T, z::T) where T <: Number = [x, 0, z]
@@ -359,22 +362,26 @@ end
 
 
 function _traj_fk(root_x::Vector{T}, root_z::Vector{T}, root_r::Vector{T};
-        start::Vector{T}=zeros(T, 3)) where T <: Number
+        start::Vector{T}=zeros(T, 3), start_angle::Vector{T}=[0,T(1)]) where T <: Number
 
     n = length(root_x)
-    rotation = Quaternion(1.0)
+    @argcheck norm(start_angle) ≈ 1
+    rotation = _vec2_to_quat(start_angle)
     translation = start
-    traj = Matrix{T}(undef, 3, n);
+    # translation = _qimag(_apply_rotation(quat(start), rotation))  # No. o.w. start pos != start.
+
+    traj = Matrix{T}(undef, 3, n+1);
+    traj[1, 1] = translation[1]
+    traj[3, 3] = translation[3]
 
     for i = 1:n
-        traj[1, i] = translation[1]
-        traj[3, i] = translation[3]
         rotation = _quaterion_angle_axis_w_y(-root_r[i]) * rotation
         next_step = quat(cat_zero_y(root_x[i], root_z[i]))
         translation = translation + _qimag(_apply_rotation(next_step, rotation))
+        traj[1, i+1] = translation[1]
+        traj[3, i+1] = translation[3]
     end
 
-    traj = hcat(start, traj)
     return traj[1,:], traj[3,:]
 end
 
@@ -392,17 +399,20 @@ This function was derived in order that FK(IK(x)) = x, i.e. a no-op. Therefore
 if the FK ops have a bug, this fn has the inverse bug (hopefully). This allows
 us to apply any changes in trajectory space directly back onto the original data.
 """
-function _traj_invk(root_xz::Matrix{T}, root_gradient::Matrix{T}) where T <: Number
+function _traj_invk(root_xz::Matrix{T}, root_gradient::Matrix{T};
+        reference_angle::Vector{T}=[0,T(1)]) where T <: Number
     N = size(root_xz, 1)
+
+    @argcheck norm(reference_angle) ≈ 1
 
     # Find "difference" in Eulerian rotation between each frame
     # (note that due to discretisation error, propagated throughout this entire
     # file, we cannot use the derivative, even if we have access to it (i.e.
     # splines) and must instead calc. the inverse operation of FK.)
-    target = repeat([0,0,1]', N, 1)
+    target = repeat(cat_zero_y(reference_angle...)', N, 1)
     forward = cat_zero_y(root_gradient)
     forward ./= sqrt.(sum(x->x^2, forward, dims=2)) # normalise
-    root_rotation = mocapio.Quatpy.Quaternions.between(forward, target).qs
+    root_rotation = Quatpy.Quaternions.between(forward, target).qs
 
     # This commented line is what is in the original IK code in Holden/Mason,but
     # is not the inverse of what is in the FK code: I'm doing the actual inverse.
@@ -413,14 +423,14 @@ function _traj_invk(root_xz::Matrix{T}, root_gradient::Matrix{T}) where T <: Num
     # Eulerian angle be r_t and the incremental angle be ρ_t. Then we have
     # r_t = \prod_{i=1}^t ρ_i   ⇒   ρ_t = r_t \prod_{i=t-1}^1 ρ_i^{-1}
     root_rvelocity = [quat(root_rotation[1,:]...)]
-    c_inv = quat(1.0)
+    c_inv = Quaternion(T(1))
+
     for i in 2:N
         c_inv *= inv(root_rvelocity[i-1])
         push!(root_rvelocity, quat(root_rotation[i,:]...) * c_inv)
     end
     root_rvelocity = map(_xz_plane_angle, root_rvelocity)
-    root_rvelocity = root_rvelocity[2:end]   # o.w assuming that start from 0, which we haven't specified,
-                                             # also o.w. is diff length to x and z.
+    root_rvelocity = root_rvelocity[1:end-1] # o.w. is diff length to x and z.
 
     # Calculate the x and z offsets for the Lagrangian frame.
     steps = diff(root_xz, dims=1)
@@ -584,7 +594,7 @@ function construct_inputs(X, raw; direction=:relative, joint_pos=true,
         slagr_r, slagr_x, slagr_z = _traj_invk(strj, s∇);
 
         # recall that the 'root' here is in currently in Lagrangian form.
-        root_r, root_x, root_z = slagr_r, slagr_x, slagr_z
+        root_x, root_z, root_r = slagr_x, slagr_z, slagr_r
     else
         root_x, root_z, root_r = raw[:, 2], raw[:, 3], raw[:, 1]
     end
@@ -595,12 +605,12 @@ function construct_inputs(X, raw; direction=:relative, joint_pos=true,
 
         ext_ixs = use_ixs.start:(use_ixs.stop + 6*Δt)
         if !smooth
-            abs_trj = mocapio._traj_fk(raw[ext_ixs, 2], raw[ext_ixs, 3], raw[ext_ixs, 1]) |> _hcat2
+            abs_trj = _traj_fk(raw[ext_ixs, 2], raw[ext_ixs, 3], raw[ext_ixs, 1]) |> _hcat2
         else
             # Absolute trajectory is offset from origin / rotated due to truncation |> FK
             # This will be ~different to smoothed offset, so find orig offset, then apply to `strj`.
             # Find difference between original start and truncated start
-            trj_orig = mocapio._traj_fk(raw[:, 2], raw[:, 3], raw[:, 1]) |> _hcat2
+            trj_orig = _traj_fk(raw[:, 2], raw[:, 3], raw[:, 1]) |> _hcat2
             δ_orig = (trj_orig[t₀:t₀,:] - trj_orig[1:1,:])
 
             # apply to smoothed trajectory
