@@ -446,8 +446,8 @@ end
 """
     construct_inputs(raw [; direction=:relative, joint_pos=true, traj_abs=false,
             fps::Int=60, smooth=false, turn360mask=false,
-            root_angle=true, speed=true, lead_ft=false, include_ftcontact=false,
-            include_ftmid=false, smooth_ix=0])
+            root_angle=true, speed=true, lead_ft=false, phase=false,
+            include_ftcontact=false, include_ftmid=false, smooth_ix=0])
 
 Construct the input matrix for the mocap models. The input `raw` is the raw
 output from the `process_file` function. The function outputs the following
@@ -469,7 +469,7 @@ The following columns are contained in the output matrix:
 * (61): joint positions in Lagrangian frame (optional).
 * (4) : foot contacts (calc. by threshold), [L ball, L toe, R ball, R toe] (optional).
 * (4) : foot contacts midpoints (optional; midpoint of each interval (see above) as binary indicator).
-* (2) : leading edge of foot contacts as boolean indicator (optional).
+* (2) : leading edge of foot contacts as boolean indicator OR phase (optional).
 
 The most important aspect is the trajectory over the next second, contained in
 the first 12 dimensions. Since the sampling frequency may not be 60 fps
@@ -505,8 +505,9 @@ dynamics. Unlike the PFNN (Holden et al.) we get around the problem of ambiguous
 phase during standing motion, as foot contacts never have ambiguity. In order to
 reduce the information bleed into the model, the options `include_ftcontact=false,
  include_ftmid=false, lead_ft=true` may be supplied which will supply only the
-leading edge of the foot contact, a little like a metronome in 2/4. The
-`include_ftmid=true` option returns the mid points of the foot contacts, which
+leading edge of the foot contact, a little like a metronome in 2/4. Instead of
+`lead_ft`, `phase=true` can be specified, interpolating between the metronome.
+The `include_ftmid=true` option returns the mid points of the foot contacts, which
 could be used instead, but the dependency is no longer causal, which may be
 problematic in some instances, and is also ambiguous during standing motion.
 For a boolean vector of all (foot) contact frames, supply `include_ftcontact=true`.
@@ -518,9 +519,10 @@ end
 
 function construct_inputs(X, raw; direction=:relative, joint_pos=true,
         traj_abs=false, fps::Int=60, smooth=false, turn360mask=false,
-        root_angle=true, speed=true, lead_ft=false, include_ftcontact=false,
-        include_ftmid=false, smooth_ix=0)
+        root_angle=true, speed=true, lead_ft=false, phase=false,
+        include_ftcontact=false, include_ftmid=false, smooth_ix=0)
     @argcheck direction in [:relative, :absolute, :none]
+    @assert !(lead_ft && phase) "only one of `phase` or `lead_ft` can be chosen."
     @argcheck fps in [30,60,120]
     @argcheck size(X)[2:3] == (21, 3)
     @argcheck size(raw, 2) == 196
@@ -550,7 +552,7 @@ function construct_inputs(X, raw; direction=:relative, joint_pos=true,
     jpnum = joint_pos ? 61 : 0
     ftnum = include_ftcontact  > 0 ? 4 : 0
     ftmnum = include_ftmid ? 4 : 0
-    ftlnum = lead_ft ? 2 : 0
+    ftlnum = (lead_ft || phase) ? 2 : 0
 
     corenum = 12 + trajanum + dirnum + anglenum + spnum + turnnum
     Xs = Matrix{T}(undef, N, corenum + jpnum + ftnum + ftmnum + ftlnum)
@@ -573,10 +575,23 @@ function construct_inputs(X, raw; direction=:relative, joint_pos=true,
         end
     end
 
-    if lead_ft
+    if lead_ft || phase
         Xix = corenum + jpnum + ftnum + ftmnum
-        for (store_offset, j) in enumerate(2:2:4)
-            Xs[:, Xix + store_offset] = foot_leadingedge(raw[use_ixs, 4+j-1])
+
+        ixs = [foot_leadingedge(raw[use_ixs, 4+j-1], ix=smooth_ix, foot=foot)
+            for (j, foot) in zip([2,4], [:left, :right])]
+
+        if phase
+            # full phase of gait cycle in sine and cosine components.
+            angle_cos_sin = make_phase_from_contacts(ixs[1], ixs[2], N)
+            Xs[:, Xix .+ (1:2)] = angle_cos_sin
+        else
+            # leading edge of foot contact only.
+            for (store_ix, ix) in enumerate(ixs)
+                out = zeros(Bool, N)
+                out[ix] .= true
+                Xs[:, Xix + store_ix] = out
+            end
         end
     end
 
@@ -617,6 +632,8 @@ function construct_inputs(X, raw; direction=:relative, joint_pos=true,
             abs_trj = strj[ext_ixs,:] .- δ_orig
             abs_trj = _antirotate2d(abs_trj, δ_orig...)
         end
+        # difference abs_trj (easier for model to imbibe this way)
+        abs_trj = diff(vcat(zeros(T, 2)', abs_trj), dims=1)
     end
 
     ######################### STORE TRAJECTORY ################################
@@ -723,9 +740,41 @@ function smooth_footcontacts(u)
     return viterbi(hmm, u) .- 1;
 end
 
-function foot_leadingedge(u)
+
+manual_rm = Dict(3=>[(785, :left)], 8=>[(401, :right)], 9=>[(959, :right)],
+    10=>[(221, :right), (2893, :right)], 15=>[(1614, :left)],
+    17=>[(1468, :left)], 27=>[(269, :right)], 30=>[(1988, :right)])
+manual_add = Dict(18=>[(645, :right), (1360, :left)],
+    19=>[(18, :left), (1570, :right)], 20=>[(688, :left), (1117, :right)],
+    21=>[(55, :left), (1062, :right)], 29=>[(544, :right)])
+
+function foot_leadingedge(u; ix=nothing, foot=nothing)
     u = smooth_footcontacts(u)
-    return vcat(false, diff(u) .== -1)
+
+    # calculate leading edges
+    leadedge = vcat(false, diff(u) .== 1)
+    leadedge = findall(leadedge .>= 0.5)
+
+    # Calculate anomalies
+    anomixs = foot_anomalies_process(foot_anomalies(leadedge, order=3, thrsh=4.0,
+            knot_spacing=8 , λ = 0.5)...)
+
+    leadedge = [e for (i,e) in enumerate(leadedge) if !(i in anomixs)]
+
+    if !(ix === nothing) && (ix > 0) && !(foot == nothing)
+        addpts = get(manual_add, ix, [])
+        for (i, _foot) in addpts
+            (_foot != foot) && continue
+            leadedge = vcat(leadedge, i)
+        end
+
+        rmpts = get(manual_rm, ix, [])
+        for (i, _foot) in rmpts
+            (_foot != foot) && continue
+            deleteat!(leadedge, leadedge .== i);
+        end
+    end
+    return sort(leadedge)
 end
 
 #= -----------------------------------------------------------------------

@@ -245,6 +245,113 @@ function smooth_trajectory(start::Vector{T}, root_x::Vector{T}, root_z::Vector{T
 end
 
 
+#= -----------------------------------------------------------------------
+                      Foot contact smoothing
+   ----------------------------------------------------------------------- =#
+using Lasso
+"""
+    foot_anomalies(ixs; knot_spacing::Int=20, thrsh::Float64=2)
+
+Fit a B-spline model to the deltas between foot contacts using L1
+regression (robust). Return any indices which are g.t. `thrsh` times
+the average deviation.
+"""
+function foot_anomalies(ixs; knot_spacing::Int=20, thrsh::Float64=5.0, order::Int=1,
+        do_plot=false, λ=1.0)
+    n = length(ixs)
+    Δs = diff(ixs)
+    knots = 1:knot_spacing:(ceil(n/knot_spacing)*knot_spacing+1)
+    basis = AxUtil.Math.bsplineM(1:n-1, knots, order+1)[:,1:end-1]
+    β = coef(fit(LassoModel, basis, Δs, intercept=true, λ=[λ]))
+    modelled = [ones(n-1,1) basis] * β
+    if do_plot
+        plot(Δs); plot(modelled);
+    end
+    _ads = abs.(Δs - modelled)
+    _mad = mean(_ads)
+    anomalies = findall((_ads ./ _mad) .> thrsh)
+    do_plot && scatter(anomalies .-1, Δs[anomalies], marker="x", color="r")
+    return anomalies, (Δs - modelled)[anomalies]
+end
+
+function foot_anomalies_process(ixs::Vector, ads)
+    n = length(ixs)
+    i = 1
+    out = []
+    while i <= n
+        if i < n && (ixs[i] + 1 == ixs[i+1]) && ads[i] < 0
+            push!(out, ixs[i+1])
+            i += 2
+            continue
+        end
+        # @warn "no matching pair for $i, $ixs[i]"
+        i += 1
+    end
+    return out
+end
+
+function make_phase_from_contacts(ixsL, ixsR, L)
+    # Merge the Left and Right foot indices, marking which came from which
+    # =====================================================================
+
+    n, n_1, n_2 = sum(length, [ixsL, ixsR]), length(ixsL), length(ixsR)
+    m_ixs, m_left = Vector{Int}(undef, n), Vector{Bool}(undef, n)
+    i_1, i_2 = 1, 1
+    for j in 1:n
+        if i_1 > n_1
+            m_ixs[j], m_left[j] = ixsR[i_2], false
+            i_2 += 1
+            continue
+        elseif i_2 > n_2
+            m_ixs[j], m_left[j] = ixsL[i_1], true
+            i_1 += 1
+            continue
+        end
+
+        if ixsL[i_1] < ixsR[i_2]
+            m_ixs[j], m_left[j] = ixsL[i_1], true
+            i_1 += 1
+        elseif ixsL[i_1] > ixsR[i_2]
+            m_ixs[j], m_left[j] = ixsR[i_2], false
+            i_2 += 1
+        else
+            print("i_1 is $i_1, i_2 is $i_2")
+            error("Unreachable error")
+        end
+    end
+
+    # Interpolate between these indices
+    # ================================================
+    out = zeros(L);
+
+    vals = [0, π]
+    prv_ix, prv_isleft = m_ixs[1], m_left[1]
+
+    for j in 2:n
+        ix, isleft = m_ixs[j], m_left[j]
+        _interp = range(0, π, length=(ix - prv_ix + 1)) .+ (isleft == 1 ? 0 : π)
+        out[prv_ix:ix] = _interp
+        prv_ix, prv_isleft = ix, isleft
+    end
+
+    # deal with beginning / end
+    # ================================================
+    δ₋ = diff(out[m_ixs[1]:m_ixs[1]+1])[1] |> mod2pi
+    for j in (m_ixs[1]-1):-1:1
+        out[j] = mod2pi(out[j+1] - δ₋)
+    end
+
+    δ₊ = diff(out[m_ixs[end]-1:m_ixs[end]])[1] |> mod2pi
+    for j in (m_ixs[end]+1):1:L
+        out[j] = mod2pi(out[j-1] + δ₊)
+    end
+
+    # turn into angular components
+    # ================================================
+    out = [cos.(out) sin.(out)];
+    return out
+end
+
 
 #= -----------------------------------------------------------------------
          Arctan -- rm jumps at 2π boundary, and define derivatives.
