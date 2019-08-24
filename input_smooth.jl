@@ -168,7 +168,7 @@ file_length=[1472,1627,1393,1422,1111,781,3016,652,2071,3071,
  1446,1568,2217,2955,2856,4525,2440,2334,2976]
 
 function smooth_trajectory(start::Vector{T}, root_x::Vector{T}, root_z::Vector{T},
-        root_r::Vector{T}; file_ix::Int=0, turn_thrsh::Float64=0.15) where T
+        root_r::Vector{T}; file_ix::Int=0, turn_thrsh::Float64=0.15, check=true) where T
 
     trj = _traj_fk(root_x, root_z, root_r; start=start);
     ϵ = get(epsilons, file_ix, 0.7)  # default 0.7, o.w. see above for epsilon
@@ -176,6 +176,7 @@ function smooth_trajectory(start::Vector{T}, root_x::Vector{T}, root_z::Vector{T
 
     # Do RDP transform and extract knots.
     simplified = rdp(traj_mat, ϵ)
+
     # Is there a better way to find indices of the returned? Yes. But here we are...
     ts = map(1:size(simplified,1)) do i
             findfirst((simplified[i,1] .≈ traj_mat[:,1]) .& (simplified[i,2] .≈ traj_mat[:,2]))
@@ -190,7 +191,7 @@ function smooth_trajectory(start::Vector{T}, root_x::Vector{T}, root_z::Vector{T
     # add/remove custom points specified above
     if file_ix > 0
         rm_knots = vcat(1, get(rm_pts, file_ix, []))   # always rm initial knot
-        @assert (length(root_x) == file_length[file_ix]) format(
+        check && @assert (length(root_x) == file_length[file_ix]) format(
             "Expecting Mason file of length {:d}. Got {:d}.", file_length[file_ix], length(root_x))
         knots[rm_knots] .= 0
         addl_knots = get(addl_pts, file_ix, [])

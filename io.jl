@@ -284,6 +284,7 @@ end
 ------------------------------------------------------------------------------=#
 
 reconstruct_modelled(Y::Matrix) = reconstruct(Y, :modelled)
+reconstruct_modelled64(Y::Matrix) = reconstruct(Y, :modelled64)
 reconstruct_raw(Y::Matrix) = reconstruct(Y, :raw)
 reconstruct_root(Y::Matrix) = reconstruct(Y, :root)[:,1,:]
 
@@ -306,12 +307,19 @@ function reconstruct(Y::Matrix{T}, input_type::Symbol) where T <: Number
         (size(Y, 2) < 70) && @warn "expecting matrix with >= 70 columns"
         root_r, root_x, root_z, joints = Y[:,1], Y[:,2], Y[:,3], Y[:,8:(63+7)]
 
-    elseif input_type == :modelled
+    elseif input_type == :modelled64
         (size(Y, 2) != 64) && @warn "expecting matrix with exactly 64 columns"
         N = size(Y, 1)
         root_r, root_x, root_z, joints = Y[:,1], Y[:,2], Y[:,3], Y[:,5:end]
         rootjoint = reduce(hcat,  (zeros(T, N, 1), Y[:,4:4], zeros(T, N, 1)))
         joints = hcat(rootjoint, joints)
+
+    elseif input_type == :modelled
+        @assert size(Y, 2) == 67 "expecting matrix with exactly 67 columns. See `reconstruct_modelled64`"
+        N = size(Y, 1)
+        root_r, root_x, root_z = (Y[:,i] + Y[:,i+3] for i in 1:3)
+        rootjoint = reduce(hcat,  (zeros(T, N, 1), Y[:,7:7], zeros(T, N, 1)))
+        joints = hcat(rootjoint, Y[:,8:end])
 
     elseif input_type == :root
         (size(Y, 2) != 3) && @warn "expecting matrix with exactly 3 columns"
@@ -322,16 +330,46 @@ function reconstruct(Y::Matrix{T}, input_type::Symbol) where T <: Number
     return _joints_fk(joints, root_x, root_z, root_r)
 end
 
+function get_traj(Y::Matrix{T}, ixs::AbstractVector; offset_xz=zeros(T, 2),
+        offset_r::T=T(0)) where T
+    @assert size(Y, 2) == 67 "expecting matrix with exactly 67 columns."
+    base_r, base_x, base_z = Y[:,1], Y[:,2], Y[:,3]
+
+    if ixs[1] > 1
+        root_r, root_x, root_z = (Y[:,i] + Y[:,i+3] for i in 1:3)
+
+        # Calculate difference between base coods and root over i < ixs[1]
+        begin_ix = 1:ixs[1]-1
+        start_angle_base = -sum(base_r[begin_ix])
+        start_angle_root = -sum(root_r[begin_ix])
+        start_angle_δ = let θ=start_angle_base - start_angle_root + offset_r; [sin(θ), cos(θ)]; end
+
+        start_base = _traj_fk(base_x[begin_ix], base_z[begin_ix], base_r[begin_ix],
+            start=cat_zero_y(offset_xz...), start_angle=[sin(offset_r), cos(offset_r)])
+        start_base = reduce(vcat, v[end] for v in start_base)
+        start_root = _traj_fk(root_x[begin_ix], root_z[begin_ix], root_r[begin_ix]) |> x -> reduce(vcat, v[end] for v in x)
+        start_δ = cat_zero_y((start_base - start_root + offset_xz)...);
+
+        traj = _traj_fk(base_x[ixs], base_z[ixs], base_r[ixs], start=start_δ ,
+                start_angle=start_angle_δ)
+    else
+        traj = _traj_fk(base_x[ixs], base_z[ixs], base_r[ixs], start=cat_zero_y(offset_xz...),
+                start_angle=[sin(offset_r), cos(offset_r)])
+    end
+    return traj
+end
+
 
 function _joints_fk(joints::Matrix{T}, root_x::Vector{T}, root_z::Vector{T},
-        root_r::Vector{T}; start::Vector{T}=zeros(T, 3)) where T <: Number
+        root_r::Vector{T}; start::Vector{T}=zeros(T, 3),
+        start_angle::Vector{T}=[0,T(1)]) where T <: Number
 
     n = size(joints, 1)
     njoints = size(joints, 2) ÷ 3
     @assert (njoints * 3 == size(joints, 2)) "number of columns must be div. 3"
     joints = _rowmaj_reshape_3d(joints, n, njoints, 3)
-    rotation = Quaternion(1.0)
-    offsets = []
+
+    rotation = _vec2_to_quat(start_angle)
     translation = start
 
     for i = 1:n
@@ -362,7 +400,7 @@ end
 
 
 function _traj_fk(root_x::Vector{T}, root_z::Vector{T}, root_r::Vector{T};
-        start::Vector{T}=zeros(T, 3), start_angle::Vector{T}=[0,T(1)]) where T <: Number
+        start::Vector=zeros(T, 3), start_angle::Vector=[0,T(1)]) where T <: Number
 
     n = length(root_x)
     @argcheck norm(start_angle) ≈ 1
@@ -372,7 +410,7 @@ function _traj_fk(root_x::Vector{T}, root_z::Vector{T}, root_r::Vector{T};
 
     traj = Matrix{T}(undef, 3, n+1);
     traj[1, 1] = translation[1]
-    traj[3, 3] = translation[3]
+    traj[3, 1] = translation[3]
 
     for i = 1:n
         rotation = _quaterion_angle_axis_w_y(-root_r[i]) * rotation
@@ -458,6 +496,7 @@ Mason dataset, so this is "future work".
 
 The following columns are contained in the output matrix:
 
+* (3):  next frame (angle, x, z) deltas ("velocities").
 * (6):  +60 frame trajectory x-cood at step 10 intervals.
 * (6):  +60 frame trajectory z-cood at step 10 intervals.
 * (12): +60 frame trajectory (x,z) absolute cood version of above.
@@ -554,7 +593,7 @@ function construct_inputs(X, raw; direction=:relative, joint_pos=true,
     ftmnum = include_ftmid ? 4 : 0
     ftlnum = (lead_ft || phase) ? 2 : 0
 
-    corenum = 12 + trajanum + dirnum + anglenum + spnum + turnnum
+    corenum = 15 + trajanum + dirnum + anglenum + spnum + turnnum
     Xs = Matrix{T}(undef, N, corenum + jpnum + ftnum + ftmnum + ftlnum)
 
     #################### EASY INPUTS TO RESOLVE ###############################
@@ -607,6 +646,7 @@ function construct_inputs(X, raw; direction=:relative, joint_pos=true,
 
         # Inverse Kinematics of smoothed trajectory => smoothed lagrange
         slagr_r, slagr_x, slagr_z = _traj_invk(strj, s∇);
+        slagr_r = fix_atan_jumps(slagr_r)
 
         # recall that the 'root' here is in currently in Lagrangian form.
         root_x, root_z, root_r = slagr_x, slagr_z, slagr_r
@@ -644,13 +684,16 @@ function construct_inputs(X, raw; direction=:relative, joint_pos=true,
         # Relative trajectory at each time t
         rs = rix:(rix+(Δt*6))
         t_x, t_z = _traj_fk(root_x[rs], root_z[rs], root_r[rs])
-        Xs[i, 1:6] = t_x[Δt:Δt:6*Δt]
-        Xs[i, 7:12] = t_z[Δt:Δt:6*Δt]
+        Xs[i, 1] = root_r[rix+1]
+        Xs[i, 2] = root_x[rix+1]
+        Xs[i, 3] = root_z[rix+1]
+        Xs[i, 4:9] = t_x[Δt:Δt:6*Δt]
+        Xs[i, 10:15] = t_z[Δt:Δt:6*Δt]
 
         # Absolute trajectory at each time t
         if traj_abs
-            Xs[i, 12 .+ (1:6)] = abs_trj[(Δt:Δt:6*Δt) .+ i, 1]
-            Xs[i, 12 .+ (7:12)] = abs_trj[(Δt:Δt:6*Δt) .+ i, 2]
+            Xs[i, 15 .+ (1:6)] = abs_trj[(Δt:Δt:6*Δt) .+ i, 1]
+            Xs[i, 15 .+ (7:12)] = abs_trj[(Δt:Δt:6*Δt) .+ i, 2]
         end
     end
 
@@ -675,23 +718,22 @@ function construct_inputs(X, raw; direction=:relative, joint_pos=true,
     rel_angle = hcat(reverse(_trigvecs(traj_vel_xz[1:end-Δ_½,:], forward[(Δt-1):(end-Δt+Δ_½r-1), :]))...)  # sinθ, cosθ
     turn360mask && (turn_mask = full_body_rotation_vs_forward(rel_angle[:,1], rel_angle[:,2]))
 
-    # display("Rel angle2     ")
-    # display(size(rel_angle))
+    # Store Direction (if appl.), Speed (if appl.), 360turn (if appl.)
     for (r, ix) in enumerate(use_ixs)
         v_ixs = (ix+1):Δt:(ix+Int(50 * ϝ)+1) # note vel is +10--> due to +5/-5 differencing
         cvel = view(traj_vel_xz, v_ixs, :)
 
         if direction == :relative
             cangle = view(rel_angle, v_ixs,:)
-            Xs[r, trajanum .+ (13:24)] = vec(cangle)
+            Xs[r, trajanum .+ (1:12) .+ 15] = vec(cangle)
         elseif direction == :absolute
             a_ixs = (ix+10):Δt:(ix+Int(60 * ϝ))
             cforward = view(forward, a_ixs, :)
-            Xs[r, trajanum .+ (13:24)] = vec(cforward)
+            Xs[r, trajanum .+ (1:12) .+ 15] = vec(cforward)
         end
 
         if speed
-            Xs[r, (12 + trajanum + dirnum) .+ (1:6)] = sqrt.(sum(x->x^2, cvel, dims=2)[:])
+            Xs[r, (15 + trajanum + dirnum) .+ (1:6)] = sqrt.(sum(x->x^2, cvel, dims=2)[:])
         elseif include_ftcontact == 2
             Xs[r, (corenum + jpnum) .+ (1:4)] *= sqrt.(sum(x->x^2, cvel, dims=2)[1])
         end
@@ -807,28 +849,36 @@ change. To account for this difference in inputs, supply a `fps=` named
 argument.
 
 """
-function construct_outputs(raw; include_ftcontact=true, fps::Int=60)
+function construct_outputs(raw; include_ftcontact=true, fps::Int=60,
+    smooth=true, smooth_ix=0)
 
     @argcheck size(raw, 2) == 196
     @argcheck fps in [30,60,120]
     ϝ = fps/60
     t₀, t₁, Δt = Int(60 * ϝ),  size(raw, 1) - Int(70 * ϝ), Int(10 * ϝ)
 
-    # if smooth
-    #     (smooth_ix <= 0) && (@warn "using default smoothing - no custom index supplied")
-    #
-    #     # perform FK and smooth the resulting root trajectory
-    #     strj, s∇, turns, sθg = smooth_trajectory(zeros(eltype(raw), 3),
-    #         raw[:, 2], raw[:, 3], raw[:, 1], file_x=smooth_ix)
-    #
-    #     # Inverse Kinematics wrt *smoothed forward direction* (s∇, since grad
-    #     # is tangent to trajectory), but raw ()
-    #     slagr_r, lagr_x, lagr_z = _traj_invk(hcat(raw[ixs, 1], raw[ixs,3]), s∇);
-    #     root = hcat(slagr_r, lagr_x, lagr_z)
-    # end
+    if smooth
+        (smooth_ix <= 0) && (@warn "using default smoothing - no custom index supplied")
+
+        # perform FK and smooth the resulting root trajectory
+        strj, s∇, turns, sθg = smooth_trajectory(zeros(eltype(raw), 3),
+            raw[:, 2], raw[:, 3], raw[:, 1], file_ix=smooth_ix)
+
+        # Inverse Kinematics of smoothed trajectory => smoothed lagrange
+        slagr_r, slagr_x, slagr_z = _traj_invk(strj, s∇);
+        slagr_r = fix_atan_jumps(slagr_r)
+
+        # recall that the 'root' here is in currently in Lagrangian form.
+        root_smooth = hcat(slagr_r, slagr_x, slagr_z)  # note order vs input version
+    end
+
     root = raw[:, 1:3]
     ixs = range(t₀, stop=t₁)
-    Y = reduce(hcat, (root[ixs,:], raw[ixs, 9:9], raw[ixs, 11:(63+7)]))
+
+    if smooth; root_stuff = hcat(root_smooth, root - root_smooth); else
+               root_stuff = hcat(root, zeros(size(root))); end
+
+    Y = reduce(hcat, (root_stuff[ixs,:], raw[ixs, 9:9], raw[ixs, 11:(63+7)]))
 
     if include_ftcontact
         Y = hcat(Y, raw[ixs, 4:7])
@@ -838,6 +888,32 @@ end
 
 # _-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-
 
+
+"""
+    find_file_offsets(file::AbstractMatrix, ff::Integer; begin_ix::Int=29)
+
+Since we construct inputs and outputs from files beginning at row `fps`, the
+smoothed / original trajectories will begin at different positions and rotations
+of the co-ordinate frame. This can results in a smoothed trajectory that does
+not match the true trajectory after performing FK. This function calculates the
+offsets in (1) position (x,z); and (2) angle associated with the truncated
+beginning of the file.
+"""
+function find_file_offsets(file::AbstractMatrix, ff::Integer; begin_ix::Int=29)
+
+    fk_ixs = 1:(begin_ix+1)
+    strj, s∇, turns, sθg = mocapio.smooth_trajectory(zeros(Float64, 3), file[:, 2],
+        file[:, 3], file[:, 1], file_ix=ff);
+
+    sδ_r, sδ_x, sδ_z = mocapio._traj_invk(strj, s∇);
+    sδ_r = mocapio.fix_atan_jumps(sδ_r)
+
+    s_θ = -sum(sδ_r[1:begin_ix]);
+    o_θ = -sum(file[1:begin_ix, 1]);
+
+    trj = mocapio._traj_fk(file[fk_ixs, 2], file[fk_ixs, 3], file[fk_ixs, 1]) |> x->hcat(x...);
+    return strj[begin_ix,:] - trj[begin_ix,:], s_θ - o_θ
+end
 
 
 # ##############################################################################
