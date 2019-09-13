@@ -221,6 +221,21 @@ function indexed_shuffle(di::DataIterator)
     order, mocaputil.DataIterator(newdata, di.batch_size, 1, di.start)
 end
 
+
+function get_file_pos_from_iter(di::DataIterator, styles_lkp::Vector,
+        style_ix::Int, ix::Int)
+    ffs = vcat([s for (i,s) in enumerate(styles_lkp) if i != style_ix]...)
+    e, file_offset = 1, di.start
+    for i in 1:ix-1
+        _, (e, file_offset) = iterate(di, (e, file_offset))
+    end
+    return ffs[e], file_offset+1
+end
+
+function get_file_pos_from_iter_test(di::DataIterator, styles_lkp::Vector,
+        style_ix::Int, ix::Int)
+    mocaputil.get_file_pos_from_iter(di, [styles_lkp[style_ix]], 0,ix)
+end
 #### TESTING
 # tmpiter = mocaputil.DataIterator(trainSTL, 256, min_size=32, start=102);
 # tmp_ii = Int[]
