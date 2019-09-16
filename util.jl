@@ -162,6 +162,57 @@ removes joint positions from an input array X (returns a copy). See `no_pos`.
 no_poscp(X::AbstractMatrix) = no_pos(X; doCopy=true)
 
 
+"""
+    generate_synthetic_inputs(N::Int; ω=0.177, speed=0.43, Δt=5)
+
+Generate an input matrix `U` for an MTDS model (using the 35-d param), for
+`N` timesteps. Currently we only have a **forward motion** implemented;
+however, one only need change the `strj` and `s∇` (tangent) in the code here.
+"""
+function generate_synthetic_inputs(N::Int; ω=0.177, speed=0.43, Δt=5)
+    X = zeros(35, N)
+    N_extra = N + 6*Δt + 1
+
+    # Trajectory generated
+    strj = hcat(zeros(N_extra), (1:N_extra).* speed) # trajectory (straight)
+    s∇ = hcat(zeros(N_extra), ones(N_extra))         # normalised tangent
+
+    # ================ Smoothed Lagrangian trajectory ===========
+    # (1) Inverse Kinematics convert to => Lagrange representation
+    slagr_r, slagr_x, slagr_z = mocapio._traj_invk(strj, s∇);
+    slagr_r = mocapio.fix_atan_jumps(slagr_r)
+    root_x, root_z, root_r = slagr_x, slagr_z, slagr_r
+
+    # (2) Convert to lagged form for use in inputs
+    for i = 1:N
+        rs = i:(i+(Δt*6))
+        t_x, t_z = mocapio._traj_fk(root_x[rs], root_z[rs], root_r[rs])
+        X[1, i], X[2, i], X[3, i] = root_r[i+1], root_x[i+1], root_z[i+1]
+        X[4:9, i] = t_x[Δt:Δt:6*Δt]
+        X[10:15, i] = t_z[Δt:Δt:6*Δt]
+    end
+
+    # ==================== Absolute differenced trajectory ==================
+    # (1) apply difference operator to Eulerian traj
+    abs_trj = diff(vcat(zeros(eltype(strj), 2)', strj), dims=1)
+
+    # (2) Convert to lagged form for use in inputs
+    for i in 1:N
+        X[15 .+ (1:6), i] = abs_trj[(Δt:Δt:6*Δt) .+ i, 1]'
+        X[15 .+ (7:12), i] = abs_trj[(Δt:Δt:6*Δt) .+ i, 2]'
+    end
+
+    # ======================= Reverse turn indicators =======================
+
+    # (All reverse turn indicators are zero)
+
+    # ============================== Phase ==================================
+    X[34, :] = cos.((1:N) .* ω)
+    X[35, :] = sin.((1:N) .* ω);
+
+    return convert(Matrix{Float32}, X')
+end
+
 #==============================================================================
     ⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅ Data Iterator  ⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅⋅
  =============================================================================#
