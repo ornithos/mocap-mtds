@@ -1,0 +1,14 @@
+#!/usr/local/bin/python3
+import sys, os
+
+args = sys.argv[1:]
+output_file = args.pop(-1)
+assert not os.path.isfile(output_file), "output file: {:s} already exists!".format(output_file)
+
+num_files = len(args)
+
+filter_complex = "".join(["[{:d}:v:0]".format(i) for i in range(num_files)]) + "concat=n={:d}".format(num_files)
+cmd = 'ffmpeg -i {:s} -filter_complex "{:s}" {:s}'.format(" -i ".join(args), filter_complex, output_file)
+
+print(cmd)
+os.system(cmd)

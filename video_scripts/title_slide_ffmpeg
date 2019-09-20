@@ -1,0 +1,34 @@
+#!/usr/local/bin/python3
+import sys, os
+
+args = sys.argv[1:]
+assert len(args) % 2 == 1, "must give an odd number of args (text, fontsize, text, fontsize, ..., filename)"
+
+secs = "2"
+kill_args = []
+for i in range(len(args)):
+    if args[i] == "--length":
+        secs = args[i+1]
+        kill_args.extend([i, i+1])
+
+kill_args.sort()
+for i in kill_args[-1::-1]:
+    args.pop(i)
+
+vf = []
+num_lines = len(args) // 2
+vspace = list(range(num_lines))
+vspace = [x - sum(vspace)/num_lines + 0.5 for x in vspace]
+vspace = [x*40 for x in vspace]
+
+for i in range(num_lines):
+    text, fontsize = args[i*2], args[i*2+1]
+    if text != "NULL":
+        vf.append('drawtext=fontfile=/Library/Fonts/Montserrat-Medium.otf:fontsize={:s}'.format(fontsize) + \
+                  ':fontcolor=white:x=(w-text_w)/2:y=(h/2 + {:.1f}):text={:s}'.format(vspace[i], text))
+
+vf = ",".join(vf)
+filename = args[-1]
+cmd = 'ffmpeg -y -f lavfi -i color=c=black:s=1520x668:d={:s} -vf "{:s}" -r 60 {:s}'.format(secs, vf, filename)
+print(cmd)
+os.system(cmd)
