@@ -94,6 +94,31 @@ drawtext=fontfile=/Library/Fonts/Montserrat-Medium.otf: text='Model side-by-side
 fontsize=26: x=45: y=598, \
 drawbox=x=35: y=588: w=435: h=44: color=black@0.8" -y test3.mp4
 
+
+#########################################
+
+
+ffmpeg -i dep_tl_lagr.mp4 -vf "drawbox=x=125: y=588: w=350: h=44: color=LightGrey@0.5: t=fill, \
+drawtext=fontfile=/Library/Fonts/Montserrat-Medium.otf: text='Side-by-side comparison': \
+fontsize=26: x=135: y=598, \
+drawbox=x=125: y=588: w=350: h=44: color=black@0.8" -y test.mp4
+
+"drawtext=enable='between(t,0,1)': fontfile=/Library/Fonts/SpaceMono-Bold.otf: fontsize=26: fontcolor=white: x=(w-text_w)/2: y=558: text='*-------------',
+drawtext=enable='between(t,1,2)': fontfile=/Library/Fonts/SpaceMono-Bold.otf: fontsize=26: fontcolor=white: x=(w-text_w)/2: y=558: text='-*------------',
+drawtext=enable='between(t,2,3)': fontfile=/Library/Fonts/SpaceMono-Bold.otf: fontsize=26: fontcolor=white: x=(w-text_w)/2: y=558: text='--*-----------',
+drawtext=enable='between(t,3,4)': fontfile=/Library/Fonts/SpaceMono-Bold.otf: fontsize=26: fontcolor=white: x=(w-text_w)/2: y=558: text='---*----------',
+drawtext=enable='between(t,4,5)': fontfile=/Library/Fonts/SpaceMono-Bold.otf: fontsize=26: fontcolor=white: x=(w-text_w)/2: y=558: text='----*---------',
+drawtext=enable='between(t,5,6)': fontfile=/Library/Fonts/SpaceMono-Bold.otf: fontsize=26: fontcolor=white: x=(w-text_w)/2: y=558: text='-----*--------',
+drawtext=enable='between(t,6,7)': fontfile=/Library/Fonts/SpaceMono-Bold.otf: fontsize=26: fontcolor=white: x=(w-text_w)/2: y=558: text='------*-------',
+drawtext=enable='between(t,7,8)': fontfile=/Library/Fonts/SpaceMono-Bold.otf: fontsize=26: fontcolor=white: x=(w-text_w)/2: y=558: text='-------*------',
+drawtext=enable='between(t,8,9)': fontfile=/Library/Fonts/SpaceMono-Bold.otf: fontsize=26: fontcolor=white: x=(w-text_w)/2: y=558: text='--------*-----',
+drawtext=enable='between(t,9,10)': fontfile=/Library/Fonts/SpaceMono-Bold.otf: fontsize=26: fontcolor=white: x=(w-text_w)/2: y=558: text='---------*----',
+drawtext=enable='between(t,10,11)': fontfile=/Library/Fonts/SpaceMono-Bold.otf: fontsize=26: fontcolor=white: x=(w-text_w)/2: y=558: text='----------*---',
+drawtext=enable='between(t,11,12)': fontfile=/Library/Fonts/SpaceMono-Bold.otf: fontsize=26: fontcolor=white: x=(w-text_w)/2: y=558: text='-----------*--',
+drawtext=enable='between(t,12,13)': fontfile=/Library/Fonts/SpaceMono-Bold.otf: fontsize=26: fontcolor=white: x=(w-text_w)/2: y=558: text='------------*-',
+drawtext=enable='between(t,13,14)': fontfile=/Library/Fonts/SpaceMono-Bold.otf: fontsize=26: fontcolor=white: x=(w-text_w)/2: y=558: text='-------------*'
+"
+
 #########################################
 # STITCH TOGETHER
 
@@ -136,3 +161,16 @@ done
 # STITCH ALL
 ./stitch_all slide01.mp4 slide02.mp4 slide1_depressed.mp4 dep.mp4 slide2_childlike.mp4 child.mp4 \
 slide3_sexy.mp4 sex.mp4 slide4_strutting.mp4 strut.mp4 merged.mp4
+
+
+
+
+# MTLopen m
+./stitch_all slide01.mp4 slide02.mp4 slide03.mp4 \
+slide1.mp4 dep8.mp4 slide2.mp4 dep16.mp4 slide3.mp4 proud8.mp4 \
+slide4.mp4 proud16.mp4 slide5.mp4 sexy8.mp4 slide6.mp4 sexy16.mp4 \
+slide7.mp4 child8.mp4 slide8.mp4 child16.mp4 merged.mp4
+
+./stitch_all slide01.mp4 slide02.mp4 slide03.mp4 \
+slide1.mp4 dep8.mp4 slide2.mp4 dep16.mp4 slide5.mp4 sexy8.mp4 slide6.mp4 sexy16.mp4 \
+slide7.mp4 child8.mp4 slide8.mp4 child16.mp4 merged.mp4
