@@ -174,3 +174,9 @@ slide7.mp4 child8.mp4 slide8.mp4 child16.mp4 merged.mp4
 ./stitch_all slide01.mp4 slide02.mp4 slide03.mp4 \
 slide1.mp4 dep8.mp4 slide2.mp4 dep16.mp4 slide5.mp4 sexy8.mp4 slide6.mp4 sexy16.mp4 \
 slide7.mp4 child8.mp4 slide8.mp4 child16.mp4 merged.mp4
+
+
+# From elsewhere
+./stitch_all slide01.mp4 slide02.mp4 slide03.mp4 slide1.mp4 dep8.mp4 slide2.mp4 dep16.mp4 slide5.mp4 sexy8.mp4 slide6.mp4 sexy16.mp4 slide7.mp4 child8.mp4 slide8.mp4 child16.mp4 merged.mp4
+./stitch_all slide01.mp4 slide02.mp4 slide1.mp4 angry.mp4 slide2.mp4 child.mp4 slide3.mp4 neut.mp4 merged.mp4
+./stitch_all slide01.mp4 slide02.mp4 slide1.mp4 _neut_dep.mp4 slide2.mp4 _dep_child.mp4 slide3.mp4 _child_strut.mp4 slide4.mp4 _strut_sexy.mp4 slide5.mp4 _sexy_proud.mp4 slide6.mp4 _proud_old.mp4 slide7.mp4 _old_neut.mp4 merged.mp4
